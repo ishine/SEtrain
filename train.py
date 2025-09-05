@@ -16,9 +16,9 @@ import torch.distributed as dist
 from torch.utils.tensorboard import SummaryWriter
 from distributed_utils import reduce_value
 
-from models.gtcrn_end2end import GTCRN as Model
+from models.gtcrn_dynamic_end2end import GTCRN as Model
 from loss_factory import HybridLoss as Loss
-from dataloader_dns3 import DNS3Dataset as Dataset
+from dataloader import DNS3Dataset as Dataset
 from scheduler import LinearWarmupCosineAnnealingLR as WarmupLR
 
 seed = 43
@@ -172,6 +172,7 @@ class Trainer:
         self.start_epoch = checkpoint['epoch'] + 1
         self.optimizer.load_state_dict(checkpoint['optimizer'])
         self.scheduler.load_state_dict(checkpoint['scheduler'])
+        # self.scheduler = WarmupLR(self.optimizer, **config['scheduler']['kwargs'])
         if self.world_size > 1:
             self.model.module.load_state_dict(checkpoint['model'])
         else:

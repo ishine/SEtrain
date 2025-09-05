@@ -4,7 +4,7 @@ network_config:
   win_len: 512
 
 DDP:
-  world_size: 2
+  world_size: 1
 
 optimizer:
   lr: 0.001
@@ -33,20 +33,20 @@ loss:
   lamda_mag: 70
 
 train_dataset: 
-  length_in_seconds: 10
-  num_data_tot: 72000  # 200 h
+  length_in_seconds: 4
+  num_data_tot: 10000
   num_data_per_epoch: 10000
   random_start_point: False
   train: True
 
 train_dataloader: 
-  batch_size: 8
+  batch_size: 4
   num_workers: 4
   drop_last: True
   pin_memory: True
 
 validation_dataset: 
-  length_in_seconds: 10
+  length_in_seconds: 4
   random_start_point: False
   train: False
 
@@ -61,6 +61,6 @@ trainer:
   epochs: 200
   save_checkpoint_interval: 1
   clip_grad_norm_value: 3.0
-  exp_path: /data/ssd0/xiaobin.rong/study_se/DNS3/exp_gtcrn
-  resume: False
-  resume_datetime: 2024-12-31-14h28m
+  exp_path: D:/windy/speech-enhancement/SEtrain/exp_gtcrn
+  resume: True
+  resume_datetime: 2025-09-03-23h37m
