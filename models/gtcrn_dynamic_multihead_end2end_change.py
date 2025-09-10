@@ -139,7 +139,7 @@ class Conv2dAttention(nn.Module):
 
     def conv(self, x, attention):
         x_pad = F.pad(x, [0, 0, self.pad_left, 0])  # pad left for causality
-        unfolded = nn.Unfold((self.kernel_size[0], 1), dilation=(self.dilation[0], 1), padding=(self.padding[0], 0), stride=(self.stride[0], 1))(x_pad)
+        unfolded = F.unfold(x_pad, (self.kernel_size[0], 1), dilation=(self.dilation[0], 1), padding=(self.padding[0], 0), stride=(self.stride[0], 1))
         unfolded2 = rearrange(unfolded, "b (c p) (t f) -> 1 (b t c) p f", c=x.shape[1], p=self.kernel_size[0], t=x.shape[2], f=x.shape[3])
         # x: (B, C, T, F)
         # unfolded: (B, C * K_T, T * F) -> (1, B*T*C, K_T, F)
@@ -162,7 +162,7 @@ class Conv2dAttention(nn.Module):
         out1 = rearrange(out, "b o t f -> 1 (b t o) 1 f")
         unfolded2 = F.conv_transpose2d(out1, grouped_kernels, bias=grouped_bias, stride=self.stride, padding=(0, self.padding[1]), groups=out.shape[0]*out.shape[2]*self.groups)
         unfolded = rearrange(unfolded2, "1 (b t c) p f -> b (c p) (t f)", b=out.shape[0], t=out.shape[2], c=self.out_channels)
-        x = nn.Fold((out.shape[2] - self.pad_left, out.shape[3]), (self.kernel_size[0], 1), dilation=(self.dilation[0], 1), padding=(self.padding[0], 0), stride=(self.stride[0], 1))(unfolded)
+        x = F.fold(unfolded, (out.shape[2] - self.pad_left, out.shape[3]), (self.kernel_size[0], 1), dilation=(self.dilation[0], 1), padding=(self.padding[0], 0), stride=(self.stride[0], 1))
         return x
     
     def forward(self, x, attention):
@@ -306,12 +306,7 @@ class Encoder(nn.Module):
             ConvBlock(16, 16, (1,5), stride=(1,2), padding=(0,2), groups=2, use_deconv=False, is_last=False),
             GTConvBlock(16, 16, (3,3), stride=(1,1), padding=(0,1), dilation=(1,1), use_deconv=False),
             GTConvBlock(16, 16, (3,3), stride=(1,1), padding=(0,1), dilation=(2,1), use_deconv=False),
-            GTConvBlock(16, 16, (3,3), stride=(1,1), padding=(0,1), dilation=(5,1), use_deconv=False),
-            # GTConvBlock(16, 16, (3,3), stride=(1,1), padding=(5,1), dilation=(5,1), use_deconv=True),
-            # GTConvBlock(16, 16, (3,3), stride=(1,1), padding=(2,1), dilation=(2,1), use_deconv=True),
-            # GTConvBlock(16, 16, (3,3), stride=(1,1), padding=(1,1), dilation=(1,1), use_deconv=True),
-            # ConvBlock(16, 16, (1,5), stride=(1,2), padding=(0,2), groups=2, use_deconv=True, is_last=False),
-            # ConvBlock(16, 2, (1,5), stride=(1,2), padding=(0,2), use_deconv=True, is_last=True)
+            GTConvBlock(16, 16, (3,3), stride=(1,1), padding=(0,1), dilation=(5,1), use_deconv=False)
         ])
 
     def forward(self, x):
@@ -433,7 +428,7 @@ if __name__ == "__main__":
     """causality check"""
     a = torch.randn(1, 16000)
     b = torch.randn(1, 16000)
-    c = torch.randn(1, 16000) * 1e12
+    c = torch.randn(1, 16000)
     x1 = torch.cat([a, b], dim=1)
     x2 = torch.cat([a, c], dim=1)
 
