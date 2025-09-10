@@ -114,8 +114,9 @@ class ConvBlock(nn.Module):
     
 
 class Conv2dAttention(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size, stride=(1,1), padding=(0,0), dilation=(1,1), kernel_choices=1, use_deconv=False, groups=1):
+    def __init__(self, in_channels, out_channels, kernel_size, stride=(1,1), padding=(0,0), dilation=(1,1), kernel_choices=1, use_deconv=False, groups=1, pad_left=0):
         super().__init__()
+        self.pad_left = pad_left
         self.kernel_size = kernel_size
         self.dilation = dilation
         self.stride = stride
@@ -137,7 +138,8 @@ class Conv2dAttention(nn.Module):
         nn.init.zeros_(self.candidates_bias)
 
     def conv(self, x, attention):
-        unfolded = nn.Unfold((self.kernel_size[0], 1), dilation=(self.dilation[0], 1), padding=(self.padding[0], 0), stride=(self.stride[0], 1))(x)
+        x_pad = F.pad(x, [0, 0, self.pad_left, 0])  # pad left for causality
+        unfolded = nn.Unfold((self.kernel_size[0], 1), dilation=(self.dilation[0], 1), padding=(self.padding[0], 0), stride=(self.stride[0], 1))(x_pad)
         unfolded2 = rearrange(unfolded, "b (c p) (t f) -> 1 (b t c) p f", c=x.shape[1], p=self.kernel_size[0], t=x.shape[2], f=x.shape[3])
         # x: (B, C, T, F)
         # unfolded: (B, C * K_T, T * F) -> (1, B*T*C, K_T, F)
@@ -151,6 +153,8 @@ class Conv2dAttention(nn.Module):
         return out
     
     def deconv(self, out, attention):
+        out = F.pad(out, [0, 0, self.pad_left, 0])  # pad left for causality
+        attention = F.pad(attention, [self.pad_left, 0], "replicate")  # pad left for causality
         grouped_kernels = torch.einsum("kiopq, bkt -> btiopq", self.candidates, attention)
         grouped_kernels = rearrange(grouped_kernels, "b t i o p q -> (b t o) i p q")
         grouped_bias = torch.einsum("ko, bkt -> bto", self.candidates_bias, attention)
@@ -158,7 +162,7 @@ class Conv2dAttention(nn.Module):
         out1 = rearrange(out, "b o t f -> 1 (b t o) 1 f")
         unfolded2 = F.conv_transpose2d(out1, grouped_kernels, bias=grouped_bias, stride=self.stride, padding=(0, self.padding[1]), groups=out.shape[0]*out.shape[2]*self.groups)
         unfolded = rearrange(unfolded2, "1 (b t c) p f -> b (c p) (t f)", b=out.shape[0], t=out.shape[2], c=self.out_channels)
-        x = nn.Fold(out.shape[2:], (self.kernel_size[0], 1), dilation=(self.dilation[0], 1), padding=(self.padding[0], 0), stride=(self.stride[0], 1))(unfolded)
+        x = nn.Fold((out.shape[2] - self.pad_left, out.shape[3]), (self.kernel_size[0], 1), dilation=(self.dilation[0], 1), padding=(self.padding[0], 0), stride=(self.stride[0], 1))(unfolded)
         return x
     
     def forward(self, x, attention):
@@ -185,7 +189,7 @@ class GTConvBlock(nn.Module):
 
         self.depth_conv = Conv2dAttention(hidden_channels, hidden_channels, kernel_size,
                                             stride=stride, padding=padding,
-                                            dilation=dilation, groups=hidden_channels, use_deconv=use_deconv)
+                                            dilation=dilation, groups=hidden_channels, use_deconv=use_deconv, pad_left=self.pad_size)
         self.depth_bn = nn.BatchNorm2d(hidden_channels)
         self.depth_act = nn.PReLU()
 
@@ -300,9 +304,9 @@ class Encoder(nn.Module):
         self.en_convs = nn.ModuleList([
             ConvBlock(3*3, 16, (1,5), stride=(1,2), padding=(0,2), use_deconv=False, is_last=False),
             ConvBlock(16, 16, (1,5), stride=(1,2), padding=(0,2), groups=2, use_deconv=False, is_last=False),
-            GTConvBlock(16, 16, (3,3), stride=(1,1), padding=(1,1), dilation=(1,1), use_deconv=False),
-            GTConvBlock(16, 16, (3,3), stride=(1,1), padding=(2,1), dilation=(2,1), use_deconv=False),
-            GTConvBlock(16, 16, (3,3), stride=(1,1), padding=(5,1), dilation=(5,1), use_deconv=False),
+            GTConvBlock(16, 16, (3,3), stride=(1,1), padding=(0,1), dilation=(1,1), use_deconv=False),
+            GTConvBlock(16, 16, (3,3), stride=(1,1), padding=(0,1), dilation=(2,1), use_deconv=False),
+            GTConvBlock(16, 16, (3,3), stride=(1,1), padding=(0,1), dilation=(5,1), use_deconv=False),
             # GTConvBlock(16, 16, (3,3), stride=(1,1), padding=(5,1), dilation=(5,1), use_deconv=True),
             # GTConvBlock(16, 16, (3,3), stride=(1,1), padding=(2,1), dilation=(2,1), use_deconv=True),
             # GTConvBlock(16, 16, (3,3), stride=(1,1), padding=(1,1), dilation=(1,1), use_deconv=True),
@@ -322,9 +326,9 @@ class Decoder(nn.Module):
     def __init__(self):
         super().__init__()
         self.de_convs = nn.ModuleList([
-            GTConvBlock(16, 16, (3,3), stride=(1,1), padding=(5,1), dilation=(5,1), use_deconv=True),
-            GTConvBlock(16, 16, (3,3), stride=(1,1), padding=(2,1), dilation=(2,1), use_deconv=True),
-            GTConvBlock(16, 16, (3,3), stride=(1,1), padding=(1,1), dilation=(1,1), use_deconv=True),
+            GTConvBlock(16, 16, (3,3), stride=(1,1), padding=(5*2,1), dilation=(5,1), use_deconv=True),
+            GTConvBlock(16, 16, (3,3), stride=(1,1), padding=(2*2,1), dilation=(2,1), use_deconv=True),
+            GTConvBlock(16, 16, (3,3), stride=(1,1), padding=(1*2,1), dilation=(1,1), use_deconv=True),
             ConvBlock(16, 16, (1,5), stride=(1,2), padding=(0,2), groups=2, use_deconv=True, is_last=False),
             ConvBlock(16, 2, (1,5), stride=(1,2), padding=(0,2), use_deconv=True, is_last=True)
         ])
@@ -427,14 +431,14 @@ if __name__ == "__main__":
     print(flops, params/1e3)
 
     """causality check"""
-    a = torch.randn(1, 160000)
-    b = torch.randn(1, 160000)
-    c = torch.randn(1, 160000)
+    a = torch.randn(1, 16000)
+    b = torch.randn(1, 16000)
+    c = torch.randn(1, 16000) * 1e12
     x1 = torch.cat([a, b], dim=1)
     x2 = torch.cat([a, c], dim=1)
 
     y1 = model(x1)[0]
     y2 = model(x2)[0]
 
-    print((y1[:int(1600*97.5)] - y2[:int(1600*97.5)]).abs().max())
+    print((y1[:16000-256*2] - y2[:16000-256*2]).abs().max())
     print((y1[16000:] - y2[16000:]).abs().max())
