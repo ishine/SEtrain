@@ -1,10 +1,10 @@
 test_dataset: 
-  noisy_dir: D:/windy/speech-enhancement/SEtrain/VCTK_DEMAND/test_noisy_16k
-  clean_dir: D:/windy/speech-enhancement/SEtrain/VCTK_DEMAND/test_clean_16k
+  noisy_dir: D:/windy/speech-enhancement/SEtrain/DNS3/test_noisy
+  clean_dir: D:/windy/speech-enhancement/SEtrain/DNS3/test_clean
 
 network:
-  exp_path: D:/windy/speech-enhancement/SEtrain/exp_gtcrn_2025-09-03-23h37m
+  exp_path: D:/windy/speech-enhancement/SEtrain/exp_gtcrn_2025-09-05-09h22m
   config: ${network.exp_path}/config.yaml
-  ckpt_name: model_027
+  ckpt_name: model_150
   checkpoint: ${network.exp_path}/checkpoints/${network.ckpt_name}.tar
-  enh_folder: ${network.exp_path}/${network.ckpt_name}/enhanced_vctk
+  enh_folder: ${network.exp_path}/${network.ckpt_name}/enhanced_dns

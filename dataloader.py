@@ -6,8 +6,8 @@ from torch.utils import data
 import numpy as np
 import random
 
-NOISY_DATABASE_TRAIN = 'D:/windy/speech-enhancement/SEtrain/VCTK_DEMAND/divided_trainset/noisy_train'
-NOISY_DATABASE_VALID = 'D:/windy/speech-enhancement/SEtrain/VCTK_DEMAND/divided_trainset/noisy_dev'
+NOISY_DATABASE_TRAIN = 'D:/windy/speech-enhancement/SEtrain/DNS3/train_noisy'
+NOISY_DATABASE_VALID = 'D:/windy/speech-enhancement/SEtrain/DNS3/dev_noisy'
 
 class DNS3Dataset(torch.utils.data.Dataset):
     def __init__(
