@@ -7,6 +7,7 @@ import numpy as np
 import torch.nn as nn
 from einops import rearrange
 import torch.nn.functional as F
+from torch.profiler import record_function
 
 
 class ERB(nn.Module):
@@ -152,6 +153,15 @@ class Conv2dAttention(nn.Module):
         out = rearrange(out, "1 (b t o) 1 f -> b o t f", b=x.shape[0], t=x.shape[2], o=self.out_channels)
         return out
     
+    def conv_and_sum(self, x, attention):
+        x_pad = F.pad(x, [0, 0, self.pad_left, 0])  # pad left for causality
+        candidates = rearrange(self.candidates, "k i o p q -> (o k) i p q")
+        bias = rearrange(self.candidates_bias, "k o -> (o k)")
+        out = F.conv2d(x_pad, candidates, bias=bias, stride=self.stride, padding=self.padding, groups=self.groups, dilation=self.dilation)
+        out = rearrange(out, "b (o k) t f -> b o k t f", o=self.out_channels, k=self.candidates_bias.shape[0])
+        out = torch.einsum("b o k t f, b k t -> b o t f", out, attention)
+        return out
+
     def deconv(self, out, attention):
         out = F.pad(out, [0, 0, self.pad_left, 0])  # pad left for causality
         attention = F.pad(attention, [self.pad_left, 0], "replicate")  # pad left for causality
@@ -165,10 +175,20 @@ class Conv2dAttention(nn.Module):
         x = F.fold(unfolded, (out.shape[2] - self.pad_left, out.shape[3]), (self.kernel_size[0], 1), dilation=(self.dilation[0], 1), padding=(self.padding[0], 0), stride=(self.stride[0], 1))
         return x
     
+    def deconv_and_sum(self, out, attention):
+        out = F.pad(out, [0, 0, self.pad_left, 0])  # pad left for causality
+        # attention = F.pad(attention, [self.pad_left, 0], "replicate")  # pad left for causality
+        candidates = rearrange(self.candidates, "k o i p q -> i (o k) p q")
+        bias = rearrange(self.candidates_bias, "k o -> (o k)")
+        out = F.conv_transpose2d(out, candidates, bias=bias, stride=self.stride, padding=self.padding, groups=self.groups, dilation=self.dilation)
+        out = rearrange(out, "b (o k) t f -> b o k t f", o=self.out_channels, k=self.candidates_bias.shape[0])
+        out = torch.einsum("b o k t f, b k t -> b o t f", out, attention)
+        return out
+    
     def forward(self, x, attention):
         if self.use_deconv:
-            return self.deconv(x, attention)
-        return self.conv(x, attention)
+            return self.deconv_and_sum(x, attention)
+        return self.conv_and_sum(x, attention)
 
 
 class GTConvBlock(nn.Module):
@@ -183,17 +203,18 @@ class GTConvBlock(nn.Module):
 
         self.ln = nn.LayerNorm((in_channels//2*3, 33))
         
-        self.point_conv1 = Conv2dAttention(in_channels//2*3, hidden_channels, (1, 1), use_deconv=use_deconv)
+        self.point_conv1 = Conv2dAttention(in_channels//2*3, hidden_channels, (1, 1), use_deconv=use_deconv, kernel_choices=kernel_choices)
         self.point_bn1 = nn.BatchNorm2d(hidden_channels)
         self.point_act = nn.PReLU()
 
         self.depth_conv = Conv2dAttention(hidden_channels, hidden_channels, kernel_size,
                                             stride=stride, padding=padding,
-                                            dilation=dilation, groups=hidden_channels, use_deconv=use_deconv, pad_left=self.pad_size)
+                                            dilation=dilation, groups=hidden_channels, use_deconv=use_deconv, pad_left=self.pad_size, 
+                                            kernel_choices=kernel_choices)
         self.depth_bn = nn.BatchNorm2d(hidden_channels)
         self.depth_act = nn.PReLU()
 
-        self.point_conv2 = Conv2dAttention(hidden_channels, in_channels//2, (1, 1), use_deconv=use_deconv)
+        self.point_conv2 = Conv2dAttention(hidden_channels, in_channels//2, (1, 1), use_deconv=use_deconv, kernel_choices=kernel_choices)
         self.point_bn2 = nn.BatchNorm2d(in_channels//2)
         
         self.tra = TRA(in_channels//2, kernel_choices, 3)
