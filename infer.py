@@ -27,7 +27,7 @@ def main(args):
 
     inf_scp_list = []
     ref_scp_list = []
-    for (noisy_wav, clean_wav) in tqdm(zip(noisy_wavs, clean_wavs)):
+    for (noisy_wav, clean_wav) in tqdm(list(zip(noisy_wavs, clean_wavs))):
         noisy, fs = sf.read(os.path.join(noisy_folder, noisy_wav), dtype='float32')
         
         input = torch.FloatTensor(noisy).unsqueeze(0).to(device)
