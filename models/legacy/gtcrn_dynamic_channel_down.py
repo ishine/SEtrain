@@ -9,8 +9,6 @@ from einops import rearrange
 import torch.nn.functional as F
 from torch.profiler import record_function
 
-calculate_macs_mode = False
-
 
 class ERB(nn.Module):
     def __init__(self, erb_subband_1, erb_subband_2, nfft=512, high_lim=8000, fs=16000):
@@ -106,13 +104,35 @@ class TRA(nn.Module):
 
 
 class ConvBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, groups=1, use_deconv=False, is_last=False):
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, groups=1, use_deconv=False, is_last=False, 
+                 time_padding=False):
         super().__init__()
         conv_module = nn.ConvTranspose2d if use_deconv else nn.Conv2d
-        self.conv = conv_module(in_channels, out_channels, kernel_size, stride, padding, groups=groups)
+        self.time_padding = time_padding
+        if not self.time_padding:
+            self.conv = conv_module(in_channels, out_channels, kernel_size, stride, padding, groups=groups)
+        if self.time_padding and not use_deconv:
+            self.conv = conv_module(in_channels, out_channels, kernel_size, stride, padding=(0,padding[1]), groups=groups)
+        else:
+            self.conv = conv_module(in_channels, out_channels, kernel_size, stride, padding=(padding[0] * 2, padding[1]), groups=groups)
         self.bn = nn.BatchNorm2d(out_channels)
         self.act = nn.Tanh() if is_last else nn.PReLU()
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.transposed = use_deconv
+        self.padding = padding
     def forward(self, x):
+        if self.time_padding and not self.transposed:
+            padding_t = (- (x.shape[2] + self.padding[0] * 2 - self.kernel_size[0] + 1 - 1)) % self.stride[0]
+            x = F.pad(x, [0, 0, self.padding[0] * 2, padding_t])
+        if self.time_padding and self.transposed:
+            x_padded_t_size = self.stride[0] * (x.shape[2] - 1) + self.kernel_size[0] - 2 * self.padding[0]
+            re_padding_t = (- (x_padded_t_size + self.padding[0] * 4 - self.kernel_size[0] + 1 - 1)) % self.stride[0]
+            # print("Re_padding_t:", re_padding_t)
+            x_pretend_size = x_padded_t_size + re_padding_t + self.padding[0] * 4
+            target_size = (x_pretend_size - self.kernel_size[0]) // self.stride[0] + 1
+            x = F.pad(x, [0, 0, target_size - x.shape[2], 0])
+            pass
         return self.act(self.bn(self.conv(x)))
     
 
@@ -189,11 +209,7 @@ class Conv2dAttention(nn.Module):
     
     def forward(self, x, attention):
         if self.use_deconv:
-            if not calculate_macs_mode:
-                return self.deconv_and_sum(x, attention)
             return self.deconv(x, attention)
-        if not calculate_macs_mode:
-            return self.conv_and_sum(x, attention)
         return self.conv(x, attention)
 
 
@@ -329,12 +345,14 @@ class Encoder(nn.Module):
     def __init__(self):
         super().__init__()
         self.en_convs = nn.ModuleList([
-            ConvBlock(3*3, 20, (1,5), stride=(1,2), padding=(0,2), use_deconv=False, is_last=False),
-            ConvBlock(20, 20, (1,5), stride=(1,2), padding=(0,2), groups=2, use_deconv=False, is_last=False),
-            GTConvBlock(20, 20, (3,3), stride=(1,1), padding=(0,1), dilation=(1,1), use_deconv=False),
-            GTConvBlock(20, 20, (3,3), stride=(1,1), padding=(0,1), dilation=(2,1), use_deconv=False),
-            GTConvBlock(20, 20, (3,3), stride=(1,1), padding=(0,1), dilation=(5,1), use_deconv=False)
-        ])
+            ConvBlock(3, 12, (1,5), stride=(1,2), padding=(0,2), use_deconv=False, is_last=False),
+            ConvBlock(12, 12, (1,5), stride=(1,2), padding=(0,2), groups=2, use_deconv=False, is_last=False),
+            # ConvBlock(12, 12, (5,1), stride=(2,1), padding=(2,0), groups=2, use_deconv=False, is_last=False, time_padding=True),
+            # ConvBlock(12, 12, (5,1), stride=(2,1), padding=(2,0), groups=2, use_deconv=False, is_last=False, time_padding=True),
+            GTConvBlock(12, 12, (3,3), stride=(1,1), padding=(0,1), dilation=(1,1), use_deconv=False),
+            GTConvBlock(12, 12, (3,3), stride=(1,1), padding=(0,1), dilation=(2,1), use_deconv=False),
+            GTConvBlock(12, 12, (3,3), stride=(1,1), padding=(0,1), dilation=(5,1), use_deconv=False)
+        ])  # padding issue 32->31
 
     def forward(self, x):
         en_outs = []
@@ -348,17 +366,21 @@ class Decoder(nn.Module):
     def __init__(self):
         super().__init__()
         self.de_convs = nn.ModuleList([
-            GTConvBlock(20, 20, (3,3), stride=(1,1), padding=(5*2,1), dilation=(5,1), use_deconv=True),
-            GTConvBlock(20, 20, (3,3), stride=(1,1), padding=(2*2,1), dilation=(2,1), use_deconv=True),
-            GTConvBlock(20, 20, (3,3), stride=(1,1), padding=(1*2,1), dilation=(1,1), use_deconv=True),
-            ConvBlock(20, 20, (1,5), stride=(1,2), padding=(0,2), groups=2, use_deconv=True, is_last=False),
-            ConvBlock(20, 2, (1,5), stride=(1,2), padding=(0,2), use_deconv=True, is_last=True)
+            GTConvBlock(12, 12, (3,3), stride=(1,1), padding=(5*2,1), dilation=(5,1), use_deconv=True),
+            GTConvBlock(12, 12, (3,3), stride=(1,1), padding=(2*2,1), dilation=(2,1), use_deconv=True),
+            GTConvBlock(12, 12, (3,3), stride=(1,1), padding=(1*2,1), dilation=(1,1), use_deconv=True),
+            # ConvBlock(12, 12, (5,1), stride=(2,1), padding=(2,0), groups=2, use_deconv=True, is_last=False, time_padding=True),
+            # ConvBlock(12, 12, (5,1), stride=(2,1), padding=(2,0), groups=2, use_deconv=True, is_last=False, time_padding=True),
+            ConvBlock(12, 12, (1,5), stride=(1,2), padding=(0,2), groups=2, use_deconv=True, is_last=False),
+            ConvBlock(12, 1, (1,5), stride=(1,2), padding=(0,2), use_deconv=True, is_last=True)
         ])
 
     def forward(self, x, en_outs):
         N_layers = len(self.de_convs)
         for i in range(N_layers):
-            x = self.de_convs[i](x + en_outs[N_layers-1-i])
+            last_out = en_outs[N_layers-1-i]
+            x = x[:, :, :last_out.shape[2], :last_out.shape[3]]
+            x = self.de_convs[i](x + last_out)
         return x
     
 
@@ -368,8 +390,8 @@ class Mask(nn.Module):
         super().__init__()
 
     def forward(self, mask, spec):
-        s_real = spec[:,0] * mask[:,0] - spec[:,1] * mask[:,1]
-        s_imag = spec[:,1] * mask[:,0] + spec[:,0] * mask[:,1]
+        s_real = spec[:,0] * mask[:,0]
+        s_imag = spec[:,1] * mask[:,0]
         s = torch.stack([s_real, s_imag], dim=1)  # (B,2,T,F)
         return s
 
@@ -391,8 +413,8 @@ class GTCRN(nn.Module):
 
         self.encoder = Encoder()
         
-        self.dpgrnn1 = DPGRNN(20, 33, 20)
-        self.dpgrnn2 = DPGRNN(20, 33, 20)
+        self.dpgrnn1 = DPGRNN(12, 33, 12)
+        self.dpgrnn2 = DPGRNN(12, 33, 12)
         
         self.decoder = Decoder()
 
@@ -414,17 +436,17 @@ class GTCRN(nn.Module):
         spec_real = spec[..., 0].permute(0,2,1)
         spec_imag = spec[..., 1].permute(0,2,1)
         spec_mag = torch.sqrt(spec_real**2 + spec_imag**2 + 1e-12)
-        feat = torch.stack([spec_mag, spec_real, spec_imag], dim=1)  # (B,3,T,257)
+        feat = rearrange(spec_mag, "b t f -> b 1 t f")  # (B,1,T,257)
         
         spec = spec.permute(0,3,2,1)  # (B,2,T,F)
 
-        feat = self.erb.bm(feat)  # (B,3,T,129)
-        feat = self.sfe(feat)     # (B,9,T,129)
+        feat = self.erb.bm(feat)  # (B,1,T,129)
+        feat = self.sfe(feat)     # (B,3,T,129)
 
         feat, en_outs = self.encoder(feat)
         
-        feat = self.dpgrnn1(feat) # (B,20,T,33)
-        feat = self.dpgrnn2(feat) # (B,20,T,33)
+        feat = self.dpgrnn1(feat) # (B,12,T,33)
+        feat = self.dpgrnn2(feat) # (B,12,T,33)
 
         m_feat = self.decoder(feat, en_outs)
         
@@ -441,13 +463,12 @@ class GTCRN(nn.Module):
 
 
 if __name__ == "__main__":
-    calculate_macs_mode = True
     model = GTCRN().eval()
 
     """complexity count"""
     from ptflops import get_model_complexity_info
     flops, params = get_model_complexity_info(model, (16000,), as_strings=True,
-                                            print_per_layer_stat=True, verbose=False, backend='aten')
+                                            print_per_layer_stat=True, verbose=True, backend='aten')
     params = 0
     for p in model.parameters():
         params += p.numel()

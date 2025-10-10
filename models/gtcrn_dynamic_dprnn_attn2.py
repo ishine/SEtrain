@@ -2,14 +2,13 @@
 GTCRN: ShuffleNetV2 + SFE + TRA + 2 DPGRNN
 Ultra tiny, 33.0 MMACs, 23.67 K params -> 93.28 MMac 89.429 K params ?
 """
+import math
 import torch
 import numpy as np
 import torch.nn as nn
 from einops import rearrange
 import torch.nn.functional as F
 from torch.profiler import record_function
-
-calculate_macs_mode = False
 
 
 class ERB(nn.Module):
@@ -189,12 +188,8 @@ class Conv2dAttention(nn.Module):
     
     def forward(self, x, attention):
         if self.use_deconv:
-            if not calculate_macs_mode:
-                return self.deconv_and_sum(x, attention)
-            return self.deconv(x, attention)
-        if not calculate_macs_mode:
-            return self.conv_and_sum(x, attention)
-        return self.conv(x, attention)
+            return self.deconv_and_sum(x, attention)
+        return self.conv_and_sum(x, attention)
 
 
 class GTConvBlock(nn.Module):
@@ -282,45 +277,95 @@ class GRNN(nn.Module):
         h = torch.cat([h1, h2], dim=-1)
         return y, h
     
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model: int, dropout: float = 0, max_len: int = 500):
+        super().__init__()
+        self.dropout = nn.Dropout(p=dropout)
+
+        position = torch.arange(max_len).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
+        pe = torch.zeros(1, max_len, d_model)
+        pe[0, :, 0::2] = torch.sin(position * div_term)
+        pe[0, :, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x + self.pe[:, :x.size(1), :]
+        return self.dropout(x)
     
-class DPGRNN(nn.Module):
-    """Grouped Dual-path RNN"""
-    def __init__(self, input_size, width, hidden_size, **kwargs):
-        super(DPGRNN, self).__init__(**kwargs)
+class DPAttn(nn.Module):
+    """Dual-path Self-Attention"""
+    def __init__(self, input_size, width, hidden_size, time_win_len, do_post_ln=False, 
+                 max_time_len=700, **kwargs):
+        super(DPAttn, self).__init__(**kwargs)
         self.input_size = input_size
         self.width = width
         self.hidden_size = hidden_size
+        self.do_post_ln = do_post_ln
 
-        self.intra_rnn = GRNN(input_size=input_size, hidden_size=hidden_size//2, bidirectional=True)
-        self.intra_fc = nn.Linear(hidden_size, hidden_size)
-        self.intra_ln = nn.LayerNorm((width, hidden_size), eps=1e-8)
+        self.pos_enc = PositionalEncoding(d_model=input_size, dropout=0, max_len=max_time_len)
+        self.intra_attn = nn.MultiheadAttention(embed_dim=input_size, num_heads=4, batch_first=True)
+        self.intra_fc1 = nn.Linear(hidden_size, hidden_size)
+        self.intra_act = nn.PReLU()
+        self.intra_fc2 = nn.Linear(hidden_size, hidden_size)
+        self.intra_pre_ln = nn.LayerNorm(hidden_size, eps=1e-8)
 
-        self.inter_rnn = GRNN(input_size=input_size, hidden_size=hidden_size, bidirectional=False)
-        self.inter_fc = nn.Linear(hidden_size, hidden_size)
-        self.inter_ln = nn.LayerNorm(((width, hidden_size)), eps=1e-8)
-    
+        inter_attn_mask = DPAttn.create_sliding_window_causal_mask(max_time_len, time_win_len)
+        self.register_buffer("inter_attn_mask", inter_attn_mask)
+        self.inter_attn = nn.MultiheadAttention(embed_dim=input_size, num_heads=4, batch_first=True)
+        self.inter_fc1 = nn.Linear(hidden_size, hidden_size)
+        self.inter_act = nn.PReLU()
+        self.inter_fc2 = nn.Linear(hidden_size, hidden_size)
+        self.inter_pre_ln = nn.LayerNorm(hidden_size, eps=1e-8)
+        self.inter_post_ln = nn.LayerNorm((width, hidden_size), eps=1e-8)
+
+    @staticmethod
+    def create_sliding_window_causal_mask(seq_len, window_size):
+        sliding_mask = torch.ones(seq_len, seq_len, dtype=torch.bool)
+        for i in range(seq_len):
+            sliding_mask[i, max(0, i - window_size + 1):i + 1] = False
+        return sliding_mask
+
     def forward(self, x):
         """x: (B, C, T, F)"""
-        ## Intra RNN
+        ## Intra Self-Attention
         x = x.permute(0, 2, 3, 1)  # (B,T,F,C)
+        residue = x
+        x = self.intra_pre_ln(x)
         intra_x = x.reshape(x.shape[0] * x.shape[1], x.shape[2], x.shape[3])  # (B*T,F,C)
-        intra_x = self.intra_rnn(intra_x)[0]  # (B*T,F,C)
-        intra_x = self.intra_fc(intra_x)      # (B*T,F,C)
+        intra_x = self.pos_enc(intra_x)
+        intra_x = self.intra_attn(intra_x, intra_x, intra_x, need_weights=False)[0]  # (B*T,F,C)
         intra_x = intra_x.reshape(x.shape[0], -1, self.width, self.hidden_size) # (B,T,F,C)
-        intra_x = self.intra_ln(intra_x)
-        intra_out = torch.add(x, intra_x)
+        intra_out = intra_x + residue
 
-        ## Inter RNN
+        residue = intra_out
+        intra_out = self.intra_fc1(intra_out)
+        intra_out = self.intra_act(intra_out)
+        intra_out = self.intra_fc2(intra_out)
+        intra_out = intra_out + residue
+
+        ## Inter Self-Attention
         x = intra_out.permute(0,2,1,3)  # (B,F,T,C)
+        residue = x
+        x = self.inter_pre_ln(x)
         inter_x = x.reshape(x.shape[0] * x.shape[1], x.shape[2], x.shape[3]) 
-        inter_x = self.inter_rnn(inter_x)[0]  # (B*F,T,C)
-        inter_x = self.inter_fc(inter_x)      # (B*F,T,C)
+        inter_x = self.pos_enc(inter_x)
+        inter_x = self.inter_attn(inter_x, inter_x, inter_x, need_weights=False, 
+                                  attn_mask=self.inter_attn_mask[:residue.shape[2], :residue.shape[2]])[0]  # (B*F,T,C)
         inter_x = inter_x.reshape(x.shape[0], self.width, -1, self.hidden_size) # (B,F,T,C)
+        inter_out = inter_x + residue
+
+        residue = inter_out
+        inter_out = self.inter_fc1(inter_out)
+        inter_out = self.inter_act(inter_out)
+        inter_out = self.inter_fc2(inter_out)
+        inter_out = inter_out + residue
+
         inter_x = inter_x.permute(0,2,1,3)   # (B,T,F,C)
-        inter_x = self.inter_ln(inter_x) 
-        inter_out = torch.add(intra_out, inter_x)
+        if self.do_post_ln:
+            inter_x = self.inter_post_ln(inter_x)
         
-        dual_out = inter_out.permute(0,3,1,2)  # (B,C,T,F)
+        dual_out = inter_x.permute(0,3,1,2)  # (B,C,T,F)
         
         return dual_out
 
@@ -329,11 +374,11 @@ class Encoder(nn.Module):
     def __init__(self):
         super().__init__()
         self.en_convs = nn.ModuleList([
-            ConvBlock(3*3, 20, (1,5), stride=(1,2), padding=(0,2), use_deconv=False, is_last=False),
-            ConvBlock(20, 20, (1,5), stride=(1,2), padding=(0,2), groups=2, use_deconv=False, is_last=False),
-            GTConvBlock(20, 20, (3,3), stride=(1,1), padding=(0,1), dilation=(1,1), use_deconv=False),
-            GTConvBlock(20, 20, (3,3), stride=(1,1), padding=(0,1), dilation=(2,1), use_deconv=False),
-            GTConvBlock(20, 20, (3,3), stride=(1,1), padding=(0,1), dilation=(5,1), use_deconv=False)
+            ConvBlock(3*3, 16, (1,5), stride=(1,2), padding=(0,2), use_deconv=False, is_last=False),
+            ConvBlock(16, 16, (1,5), stride=(1,2), padding=(0,2), groups=2, use_deconv=False, is_last=False),
+            GTConvBlock(16, 16, (3,3), stride=(1,1), padding=(0,1), dilation=(1,1), use_deconv=False),
+            GTConvBlock(16, 16, (3,3), stride=(1,1), padding=(0,1), dilation=(2,1), use_deconv=False),
+            GTConvBlock(16, 16, (3,3), stride=(1,1), padding=(0,1), dilation=(5,1), use_deconv=False)
         ])
 
     def forward(self, x):
@@ -348,11 +393,11 @@ class Decoder(nn.Module):
     def __init__(self):
         super().__init__()
         self.de_convs = nn.ModuleList([
-            GTConvBlock(20, 20, (3,3), stride=(1,1), padding=(5*2,1), dilation=(5,1), use_deconv=True),
-            GTConvBlock(20, 20, (3,3), stride=(1,1), padding=(2*2,1), dilation=(2,1), use_deconv=True),
-            GTConvBlock(20, 20, (3,3), stride=(1,1), padding=(1*2,1), dilation=(1,1), use_deconv=True),
-            ConvBlock(20, 20, (1,5), stride=(1,2), padding=(0,2), groups=2, use_deconv=True, is_last=False),
-            ConvBlock(20, 2, (1,5), stride=(1,2), padding=(0,2), use_deconv=True, is_last=True)
+            GTConvBlock(16, 16, (3,3), stride=(1,1), padding=(5*2,1), dilation=(5,1), use_deconv=True),
+            GTConvBlock(16, 16, (3,3), stride=(1,1), padding=(2*2,1), dilation=(2,1), use_deconv=True),
+            GTConvBlock(16, 16, (3,3), stride=(1,1), padding=(1*2,1), dilation=(1,1), use_deconv=True),
+            ConvBlock(16, 16, (1,5), stride=(1,2), padding=(0,2), groups=2, use_deconv=True, is_last=False),
+            ConvBlock(16, 2, (1,5), stride=(1,2), padding=(0,2), use_deconv=True, is_last=True)
         ])
 
     def forward(self, x, en_outs):
@@ -391,8 +436,8 @@ class GTCRN(nn.Module):
 
         self.encoder = Encoder()
         
-        self.dpgrnn1 = DPGRNN(20, 33, 20)
-        self.dpgrnn2 = DPGRNN(20, 33, 20)
+        self.dpgrnn1 = DPAttn(16, 33, 16, 200)
+        self.dpgrnn2 = DPAttn(16, 33, 16, 200, do_post_ln=True)
         
         self.decoder = Decoder()
 
@@ -423,8 +468,8 @@ class GTCRN(nn.Module):
 
         feat, en_outs = self.encoder(feat)
         
-        feat = self.dpgrnn1(feat) # (B,20,T,33)
-        feat = self.dpgrnn2(feat) # (B,20,T,33)
+        feat = self.dpgrnn1(feat) # (B,16,T,33)
+        feat = self.dpgrnn2(feat) # (B,16,T,33)
 
         m_feat = self.decoder(feat, en_outs)
         
@@ -441,7 +486,6 @@ class GTCRN(nn.Module):
 
 
 if __name__ == "__main__":
-    calculate_macs_mode = True
     model = GTCRN().eval()
 
     """complexity count"""

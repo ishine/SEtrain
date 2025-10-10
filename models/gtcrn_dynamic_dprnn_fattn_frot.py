@@ -2,14 +2,13 @@
 GTCRN: ShuffleNetV2 + SFE + TRA + 2 DPGRNN
 Ultra tiny, 33.0 MMACs, 23.67 K params -> 93.28 MMac 89.429 K params ?
 """
+import math
 import torch
 import numpy as np
 import torch.nn as nn
 from einops import rearrange
 import torch.nn.functional as F
 from torch.profiler import record_function
-
-calculate_macs_mode = False
 
 
 class ERB(nn.Module):
@@ -189,12 +188,8 @@ class Conv2dAttention(nn.Module):
     
     def forward(self, x, attention):
         if self.use_deconv:
-            if not calculate_macs_mode:
-                return self.deconv_and_sum(x, attention)
-            return self.deconv(x, attention)
-        if not calculate_macs_mode:
-            return self.conv_and_sum(x, attention)
-        return self.conv(x, attention)
+            return self.deconv_and_sum(x, attention)
+        return self.conv_and_sum(x, attention)
 
 
 class GTConvBlock(nn.Module):
@@ -282,6 +277,113 @@ class GRNN(nn.Module):
         h = torch.cat([h1, h2], dim=-1)
         return y, h
     
+class RotaryPositionalEmbedding(nn.Module):
+    """Rotary Position Embedding (RoPE) utilities for attention heads.
+
+    Provides precomputed cos/sin buffers and apply() to rotate Q/K.
+    """
+    def __init__(self, dim: int, max_len: int = 512, base: float = 10000.0):
+        super().__init__()
+        assert dim % 2 == 0, "RoPE head dim must be even"
+        self.dim = dim
+        self.max_len = max_len
+
+        # Precompute frequencies
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))  # (dim/2,)
+        t = torch.arange(max_len, dtype=torch.float32)  # (max_len,)
+        freqs = torch.einsum('n,d->nd', t, inv_freq)  # (max_len, dim/2)
+        # Expand to full dim by duplicating for even/odd pairs
+        emb = torch.cat([freqs, freqs], dim=-1)  # (max_len, dim)
+        cos = emb.cos()
+        sin = emb.sin()
+        self.register_buffer('cos_cached', cos, persistent=False)
+        self.register_buffer('sin_cached', sin, persistent=False)
+
+    def get_cos_sin(self, seq_len: int, device=None, dtype=None):
+        cos = self.cos_cached[:seq_len]
+        sin = self.sin_cached[:seq_len]
+        if device is not None:
+            cos = cos.to(device)
+            sin = sin.to(device)
+        if dtype is not None:
+            cos = cos.to(dtype)
+            sin = sin.to(dtype)
+        return cos, sin  # (seq_len, dim)
+
+    @staticmethod
+    def rotate_half(x: torch.Tensor) -> torch.Tensor:
+        # x: (..., dim)
+        dim = x.shape[-1]
+        x1 = x[..., : dim // 2]
+        x2 = x[..., dim // 2:]
+        return torch.cat([-x2, x1], dim=-1)
+
+    def apply_rotary(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+        """Apply rotary embedding.
+
+        x: (B, H, N, D)
+        cos/sin: (N, D)
+        returns: (B, H, N, D)
+        """
+        cos = cos[None, None, :, :]  # (1,1,N,D)
+        sin = sin[None, None, :, :]  # (1,1,N,D)
+        return x * cos + self.rotate_half(x) * sin
+
+
+class MultiheadSelfAttentionRoPE(nn.Module):
+    """Multi-Head Self-Attention with Rotary Positional Embedding (RoPE)."""
+    def __init__(self, embed_dim: int, num_heads: int, dropout: float = 0.0, bias: bool = True, max_len: int = 512, rope_base: float = 10000.0):
+        super().__init__()
+        assert embed_dim % num_heads == 0, "embed_dim must be divisible by num_heads"
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        assert self.head_dim % 2 == 0, "RoPE requires even head_dim"
+
+        self.q_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+        self.k_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+        self.v_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+        self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+        self.attn_drop = nn.Dropout(dropout)
+
+        self.rope = RotaryPositionalEmbedding(dim=self.head_dim, max_len=max_len, base=rope_base)
+
+    def forward(self, query: torch.Tensor, key: torch.Tensor = None, value: torch.Tensor = None, need_weights: bool = False, attn_mask: torch.Tensor = None):
+        # Support self-attention call style compatible with nn.MultiheadAttention
+        if key is None:
+            key = query
+        if value is None:
+            value = key
+
+        B, N, C = query.shape  # (batch, seq_len, embed)
+        q = self.q_proj(query)
+        k = self.k_proj(key)
+        v = self.v_proj(value)
+
+        # (B, H, N, D)
+        q = q.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+        v = v.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+
+        # RoPE
+        cos, sin = self.rope.get_cos_sin(N, device=query.device, dtype=query.dtype)
+        q = self.rope.apply_rotary(q, cos, sin)
+        k = self.rope.apply_rotary(k, cos, sin)
+
+        attn_scores = torch.matmul(q, k.transpose(-1, -2)) / math.sqrt(self.head_dim)  # (B,H,N,N)
+        if attn_mask is not None:
+            attn_scores = attn_scores + attn_mask
+        attn = torch.softmax(attn_scores, dim=-1)
+        attn = self.attn_drop(attn)
+        out = torch.matmul(attn, v)  # (B,H,N,D)
+
+        out = out.transpose(1, 2).contiguous().view(B, N, C)
+        out = self.out_proj(out)
+        if need_weights:
+            # Return average attention weights across heads to match nn.MultiheadAttention API
+            avg_weights = attn.mean(dim=1)  # (B,N,N)
+            return out, avg_weights
+        return out, None
     
 class DPGRNN(nn.Module):
     """Grouped Dual-path RNN"""
@@ -291,24 +393,35 @@ class DPGRNN(nn.Module):
         self.width = width
         self.hidden_size = hidden_size
 
-        self.intra_rnn = GRNN(input_size=input_size, hidden_size=hidden_size//2, bidirectional=True)
-        self.intra_fc = nn.Linear(hidden_size, hidden_size)
-        self.intra_ln = nn.LayerNorm((width, hidden_size), eps=1e-8)
+        # RoPE-based self-attention across frequency (sequence length = width)
+        self.intra_attn = MultiheadSelfAttentionRoPE(embed_dim=input_size, num_heads=4, dropout=0.0, max_len=width)
+        # Pre-norm transformer style: LN before each sub-layer, and LN acts on C only
+        self.intra_pre_ln = nn.LayerNorm(hidden_size, eps=1e-8)   # for attention
+        self.intra_post_ln = nn.LayerNorm(hidden_size, eps=1e-8)  # for FFN (pre-FFN LN)
+        self.intra_fc1 = nn.Linear(hidden_size, hidden_size)
+        self.intra_act = nn.PReLU()
+        self.intra_fc2 = nn.Linear(hidden_size, hidden_size)
 
         self.inter_rnn = GRNN(input_size=input_size, hidden_size=hidden_size, bidirectional=False)
         self.inter_fc = nn.Linear(hidden_size, hidden_size)
-        self.inter_ln = nn.LayerNorm(((width, hidden_size)), eps=1e-8)
+        # Make inter LN also act only on C dimension
+        self.inter_ln = nn.LayerNorm(hidden_size, eps=1e-8)
     
     def forward(self, x):
         """x: (B, C, T, F)"""
-        ## Intra RNN
+        ## Intra Self-Attention
         x = x.permute(0, 2, 3, 1)  # (B,T,F,C)
-        intra_x = x.reshape(x.shape[0] * x.shape[1], x.shape[2], x.shape[3])  # (B*T,F,C)
-        intra_x = self.intra_rnn(intra_x)[0]  # (B*T,F,C)
-        intra_x = self.intra_fc(intra_x)      # (B*T,F,C)
-        intra_x = intra_x.reshape(x.shape[0], -1, self.width, self.hidden_size) # (B,T,F,C)
-        intra_x = self.intra_ln(intra_x)
-        intra_out = torch.add(x, intra_x)
+        # Attention sub-layer: y = x + Attn(LN(x))
+        attn_in = self.intra_pre_ln(x)
+        attn_in = attn_in.reshape(attn_in.shape[0] * attn_in.shape[1], attn_in.shape[2], attn_in.shape[3])  # (B*T,F,C)
+        attn_out = self.intra_attn(attn_in, need_weights=False)[0]  # (B*T,F,C)
+        attn_out = attn_out.reshape(x.shape[0], -1, self.width, self.hidden_size)  # (B,T,F,C)
+        y = x + attn_out
+
+        # FFN sub-layer: z = y + FFN(LN(y))
+        ffn_in = self.intra_post_ln(y)
+        ffn = self.intra_fc2(self.intra_act(self.intra_fc1(ffn_in)))
+        intra_out = y + ffn
 
         ## Inter RNN
         x = intra_out.permute(0,2,1,3)  # (B,F,T,C)
@@ -329,11 +442,11 @@ class Encoder(nn.Module):
     def __init__(self):
         super().__init__()
         self.en_convs = nn.ModuleList([
-            ConvBlock(3*3, 20, (1,5), stride=(1,2), padding=(0,2), use_deconv=False, is_last=False),
-            ConvBlock(20, 20, (1,5), stride=(1,2), padding=(0,2), groups=2, use_deconv=False, is_last=False),
-            GTConvBlock(20, 20, (3,3), stride=(1,1), padding=(0,1), dilation=(1,1), use_deconv=False),
-            GTConvBlock(20, 20, (3,3), stride=(1,1), padding=(0,1), dilation=(2,1), use_deconv=False),
-            GTConvBlock(20, 20, (3,3), stride=(1,1), padding=(0,1), dilation=(5,1), use_deconv=False)
+            ConvBlock(3*3, 16, (1,5), stride=(1,2), padding=(0,2), use_deconv=False, is_last=False),
+            ConvBlock(16, 16, (1,5), stride=(1,2), padding=(0,2), groups=2, use_deconv=False, is_last=False),
+            GTConvBlock(16, 16, (3,3), stride=(1,1), padding=(0,1), dilation=(1,1), use_deconv=False),
+            GTConvBlock(16, 16, (3,3), stride=(1,1), padding=(0,1), dilation=(2,1), use_deconv=False),
+            GTConvBlock(16, 16, (3,3), stride=(1,1), padding=(0,1), dilation=(5,1), use_deconv=False)
         ])
 
     def forward(self, x):
@@ -348,11 +461,11 @@ class Decoder(nn.Module):
     def __init__(self):
         super().__init__()
         self.de_convs = nn.ModuleList([
-            GTConvBlock(20, 20, (3,3), stride=(1,1), padding=(5*2,1), dilation=(5,1), use_deconv=True),
-            GTConvBlock(20, 20, (3,3), stride=(1,1), padding=(2*2,1), dilation=(2,1), use_deconv=True),
-            GTConvBlock(20, 20, (3,3), stride=(1,1), padding=(1*2,1), dilation=(1,1), use_deconv=True),
-            ConvBlock(20, 20, (1,5), stride=(1,2), padding=(0,2), groups=2, use_deconv=True, is_last=False),
-            ConvBlock(20, 2, (1,5), stride=(1,2), padding=(0,2), use_deconv=True, is_last=True)
+            GTConvBlock(16, 16, (3,3), stride=(1,1), padding=(5*2,1), dilation=(5,1), use_deconv=True),
+            GTConvBlock(16, 16, (3,3), stride=(1,1), padding=(2*2,1), dilation=(2,1), use_deconv=True),
+            GTConvBlock(16, 16, (3,3), stride=(1,1), padding=(1*2,1), dilation=(1,1), use_deconv=True),
+            ConvBlock(16, 16, (1,5), stride=(1,2), padding=(0,2), groups=2, use_deconv=True, is_last=False),
+            ConvBlock(16, 2, (1,5), stride=(1,2), padding=(0,2), use_deconv=True, is_last=True)
         ])
 
     def forward(self, x, en_outs):
@@ -391,8 +504,8 @@ class GTCRN(nn.Module):
 
         self.encoder = Encoder()
         
-        self.dpgrnn1 = DPGRNN(20, 33, 20)
-        self.dpgrnn2 = DPGRNN(20, 33, 20)
+        self.dpgrnn1 = DPGRNN(16, 33, 16)
+        self.dpgrnn2 = DPGRNN(16, 33, 16)
         
         self.decoder = Decoder()
 
@@ -423,8 +536,8 @@ class GTCRN(nn.Module):
 
         feat, en_outs = self.encoder(feat)
         
-        feat = self.dpgrnn1(feat) # (B,20,T,33)
-        feat = self.dpgrnn2(feat) # (B,20,T,33)
+        feat = self.dpgrnn1(feat) # (B,16,T,33)
+        feat = self.dpgrnn2(feat) # (B,16,T,33)
 
         m_feat = self.decoder(feat, en_outs)
         
@@ -441,7 +554,6 @@ class GTCRN(nn.Module):
 
 
 if __name__ == "__main__":
-    calculate_macs_mode = True
     model = GTCRN().eval()
 
     """complexity count"""
