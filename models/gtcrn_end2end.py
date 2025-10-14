@@ -338,6 +338,72 @@ class GTCRN(nn.Module):
         output = torch.nn.functional.pad(output, (0, n_samples-output.shape[1]))
         
         return output
+    
+class GTCRN_TSE(nn.Module):
+    def __init__(self, embedding_dim=192, n_fft=512, hop_len=256, win_len=512):
+        super().__init__()
+        self.n_fft = n_fft
+        self.hop_len = hop_len
+        self.win_len = win_len
+
+        self.erb = ERB(65, 64)
+        self.sfe = SFE(3, 1)
+        self.encoder = Encoder()
+        self.dpgrnn1 = DPGRNN(16, 33, 16)
+        self.dpgrnn2 = DPGRNN(16, 33, 16)
+        self.decoder = Decoder()
+        self.mask = Mask()
+        self.emb_fc = nn.Linear(embedding_dim, 16)
+        self.mask_fc = nn.Linear(32, 2) # 输出2通道->mask,融合embedding
+
+    def forward(self, x, embedding):
+        """
+        x: (B, L)  # 波形
+        embedding: (B, embedding_dim)
+        return: (B, L)  # 增强波形
+        """
+        device = x.device
+        n_samples = x.shape[1]
+        stft_kwargs = {'n_fft': self.n_fft, 'hop_length': self.hop_len, 'win_length': self.win_len,
+                       'window': torch.hann_window(self.win_len).to(device), 'onesided': True}
+
+        spec = torch.stft(x, **stft_kwargs, return_complex=True)
+        spec = torch.view_as_real(spec)  # (B, F, T, 2)
+
+        spec_real = spec[..., 0].permute(0, 2, 1)
+        spec_imag = spec[..., 1].permute(0, 2, 1)
+        spec_mag = torch.sqrt(spec_real ** 2 + spec_imag ** 2 + 1e-12)
+        feat = torch.stack([spec_mag, spec_real, spec_imag], dim=1)  # (B, 3, T, F)
+
+        spec_ref = spec.permute(0, 3, 2, 1)  # (B, 2, T, F)
+
+        feat = self.erb.bm(feat)
+        feat = self.sfe(feat)
+        feat, en_outs = self.encoder(feat)
+        feat = self.dpgrnn1(feat)
+        feat = self.dpgrnn2(feat)
+        m_feat = self.decoder(feat, en_outs)  # (B, 16, T, 33)
+
+        # 嵌入融合
+        emb_proj = self.emb_fc(embedding)  # (B, 16)
+        B, C, T, F = m_feat.shape
+        emb_expanded = emb_proj.unsqueeze(-1).unsqueeze(-1).expand(-1, C, T, F)
+        m_feat_fused = torch.cat([m_feat, emb_expanded], dim=1)  # (B, 32, T, F)
+
+        ## 符合mask要求的处理
+        m_feat_fused = self.mask_fc(m_feat_fused)  # (B, 2, T, F)
+        m = self.erb.bs(m_feat_fused)
+
+        spec_enh = self.mask(m, spec_ref)  # (B, 2, T, F)
+        spec_enh = spec_enh.permute(0, 3, 2, 1)  # (B, F, T, 2)
+
+        # 还原为复数谱
+        spec_enh_c = torch.complex(spec_enh[..., 0], spec_enh[..., 1])
+        output = torch.istft(spec_enh_c, **stft_kwargs)
+        output = torch.nn.functional.pad(output, (0, n_samples - output.shape[1]))
+
+        return output
+
 
 
 if __name__ == "__main__":
