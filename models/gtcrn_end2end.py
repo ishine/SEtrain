@@ -2,10 +2,15 @@
 GTCRN: ShuffleNetV2 + SFE + TRA + 2 DPGRNN
 Ultra tiny, 33.0 MMACs, 23.67 K params
 """
+import logging
+from unittest import skip
 import torch
 import numpy as np
 import torch.nn as nn
 from einops import rearrange
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
 class ERB(nn.Module):
@@ -254,10 +259,21 @@ class Decoder(nn.Module):
             ConvBlock(16, 16, (1,5), stride=(1,2), padding=(0,2), groups=2, use_deconv=True, is_last=False),
             ConvBlock(16, 2, (1,5), stride=(1,2), padding=(0,2), use_deconv=True, is_last=True)
         ])
+        self.skip_fc = nn.Conv2d(16, 32, 1)
+        self.reduce_fc = nn.Conv2d(32, 16, 1)
+        
 
     def forward(self, x, en_outs):
         N_layers = len(self.de_convs)
-        for i in range(N_layers):
+        # 第一层跳跃连接需要通道数一致
+        logger.info(f"Decoder input shape: {x.shape}")
+        skip = self.skip_fc(en_outs[N_layers-1-0])
+        x = x + skip
+        x = self.reduce_fc(x)  # 降到16通道
+        x = self.de_convs[0](x)
+        logger.info(f"Decoder first layer input shape: {x.shape}")
+        logger.info(f"en_outs[N_layers-1-0] shape: {en_outs[N_layers-1-0].shape}")
+        for i in range(1, N_layers):
             x = self.de_convs[i](x + en_outs[N_layers-1-i])
         return x
     
@@ -351,10 +367,10 @@ class GTCRN_TSE(nn.Module):
         self.encoder = Encoder()
         self.dpgrnn1 = DPGRNN(16, 33, 16)
         self.dpgrnn2 = DPGRNN(16, 33, 16)
-        self.decoder = Decoder()
+        self.decoder = Decoder() # 输出2通道
         self.mask = Mask()
         self.emb_fc = nn.Linear(embedding_dim, 16)
-        self.mask_fc = nn.Linear(32, 2) # 输出2通道->mask,融合embedding
+        # self.mask_fc = nn.Linear(32, 2) # 输出2通道->mask,融合embedding
 
     def forward(self, x, embedding):
         """
@@ -382,17 +398,16 @@ class GTCRN_TSE(nn.Module):
         feat, en_outs = self.encoder(feat)
         feat = self.dpgrnn1(feat)
         feat = self.dpgrnn2(feat)
-        m_feat = self.decoder(feat, en_outs)  # (B, 16, T, 33)
 
-        # 嵌入融合
+        # 嵌入融合（在decoder输入前，feat为16通道）
         emb_proj = self.emb_fc(embedding)  # (B, 16)
-        B, C, T, F = m_feat.shape
+        B, C, T, F = feat.shape
         emb_expanded = emb_proj.unsqueeze(-1).unsqueeze(-1).expand(-1, C, T, F)
-        m_feat_fused = torch.cat([m_feat, emb_expanded], dim=1)  # (B, 32, T, F)
+        feat_fused = torch.cat([feat, emb_expanded], dim=1)  # (B, 32, T, F)
 
-        ## 符合mask要求的处理
-        m_feat_fused = self.mask_fc(m_feat_fused)  # (B, 2, T, F)
-        m = self.erb.bs(m_feat_fused)
+        m_feat = self.decoder(feat_fused, en_outs)  # (B, 2, T, F)
+        
+        m = self.erb.bs(m_feat)
 
         spec_enh = self.mask(m, spec_ref)  # (B, 2, T, F)
         spec_enh = spec_enh.permute(0, 3, 2, 1)  # (B, F, T, 2)
