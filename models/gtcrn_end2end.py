@@ -259,23 +259,14 @@ class Decoder(nn.Module):
             ConvBlock(16, 16, (1,5), stride=(1,2), padding=(0,2), groups=2, use_deconv=True, is_last=False),
             ConvBlock(16, 2, (1,5), stride=(1,2), padding=(0,2), use_deconv=True, is_last=True)
         ])
-        self.skip_fc = nn.Conv2d(16, 32, 1)
-        self.reduce_fc = nn.Conv2d(32, 16, 1)
-        
 
     def forward(self, x, en_outs):
         N_layers = len(self.de_convs)
-        # 第一层跳跃连接需要通道数一致
-        logger.info(f"Decoder input shape: {x.shape}")
-        skip = self.skip_fc(en_outs[N_layers-1-0])
-        x = x + skip
-        x = self.reduce_fc(x)  # 降到16通道
-        x = self.de_convs[0](x)
-        logger.info(f"Decoder first layer input shape: {x.shape}")
-        logger.info(f"en_outs[N_layers-1-0] shape: {en_outs[N_layers-1-0].shape}")
-        for i in range(1, N_layers):
+        for i in range(N_layers):
             x = self.de_convs[i](x + en_outs[N_layers-1-i])
         return x
+    
+
     
 
 class Mask(nn.Module):
@@ -288,7 +279,100 @@ class Mask(nn.Module):
         s_imag = spec[:,1] * mask[:,0] + spec[:,0] * mask[:,1]
         s = torch.stack([s_real, s_imag], dim=1)  # (B,2,T,F)
         return s
+    
+    
+class FiLM(nn.Module):
+    """Feature-wise Linear Modulation (FiLM) layer
+    https://github.com/HuangZiliAndy/fairseq/blob/multispk/fairseq/models/wavlm/WavLM.py#L1160  # noqa
+    """
 
+    def __init__(self,
+                 feat_size,
+                 embed_size,
+                 num_film_layers=1,
+                 layer_norm=False):
+        super(FiLM, self).__init__()
+        self.feat_size = feat_size
+        self.embed_size = embed_size
+        self.num_film_layers = num_film_layers
+        self.layer_norm = nn.LayerNorm(embed_size) if layer_norm else None
+        gamma_fcs, beta_fcs = [], []
+        for i in range(num_film_layers):
+            if i == 0:
+                gamma_fcs.append(nn.Linear(embed_size, feat_size))
+                beta_fcs.append(nn.Linear(embed_size, feat_size))
+            else:
+                gamma_fcs.append(nn.Linear(feat_size, feat_size))
+                beta_fcs.append(nn.Linear(feat_size, feat_size))
+        self.gamma_fcs = nn.ModuleList(gamma_fcs)
+        self.beta_fcs = nn.ModuleList(beta_fcs)
+        self.init_weights()
+
+    def init_weights(self):
+        for i in range(self.num_film_layers):
+            nn.init.zeros_(self.gamma_fcs[i].weight)
+            nn.init.zeros_(self.gamma_fcs[i].bias)
+            nn.init.zeros_(self.beta_fcs[i].weight)
+            nn.init.zeros_(self.beta_fcs[i].bias)
+
+    def forward(self, embed, x):
+        gamma, beta = None, None
+        for i in range(len(self.gamma_fcs)):
+            if i == 0:
+                gamma = self.gamma_fcs[i](embed)
+                beta = self.beta_fcs[i](embed)
+            else:
+                gamma = self.gamma_fcs[i](gamma)
+                beta = self.beta_fcs[i](beta)
+
+        if len(gamma.shape) < len(x.shape):
+            gamma = gamma.unsqueeze(-1).expand_as(x)
+            beta = beta.unsqueeze(-1).expand_as(x)
+        else:
+            gamma = gamma.expand_as(x)
+            beta = beta.expand_as(x)
+
+        # print(gamma.size(), beta.size())
+        x = (1 + gamma) * x + beta
+        if self.layer_norm is not None:
+            x = self.layer_norm(x)
+        return x    
+
+class FiLMLayer(nn.Module):
+    def __init__(self, feat_channels, emb_dim, hidden=128, init_gamma=1.0):
+        """
+        feat_channels: C (e.g., 16 in your GTCRN)
+        emb_dim: dimension of speaker embedding (e.g., 192 or 512)
+        hidden: hidden dim for MLP
+        init_gamma: init value for gamma near 1
+        """
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(emb_dim, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, 2 * feat_channels)  # output gamma and beta for each channel
+        )
+        # initialize so gamma ~ 1, beta ~ 0
+        nn.init.zeros_(self.mlp[2].bias)
+        # set final weights small
+        nn.init.normal_(self.mlp[2].weight, std=1e-3)
+        self.feat_channels = feat_channels
+        self.init_gamma = init_gamma
+
+    def forward(self, feat, emb):
+        """
+        feat: (B, C, T, F)
+        emb:  (B, E)
+        returns: (B, C, T, F)
+        """
+        B, C, T, F = feat.shape
+        params = self.mlp(emb)                 # (B, 2C)
+        gamma, beta = params[:, :C], params[:, C:]  # each (B, C)
+        # shift gamma so initial is ~1 (if desired); alternative: learnable scale
+        gamma = gamma + self.init_gamma
+        gamma = gamma.view(B, C, 1, 1)
+        beta  = beta.view(B, C, 1, 1)
+        return gamma * feat + beta
 
 class GTCRN(nn.Module):
     def __init__(
@@ -365,12 +449,14 @@ class GTCRN_TSE(nn.Module):
         self.erb = ERB(65, 64)
         self.sfe = SFE(3, 1)
         self.encoder = Encoder()
+
+        self.film = FiLMLayer(feat_channels=16, emb_dim=embedding_dim, hidden=128)
+
         self.dpgrnn1 = DPGRNN(16, 33, 16)
         self.dpgrnn2 = DPGRNN(16, 33, 16)
         self.decoder = Decoder() # 输出2通道
         self.mask = Mask()
-        self.emb_fc = nn.Linear(embedding_dim, 16)
-        # self.mask_fc = nn.Linear(32, 2) # 输出2通道->mask,融合embedding
+        
 
     def forward(self, x, embedding):
         """
@@ -389,24 +475,21 @@ class GTCRN_TSE(nn.Module):
         spec_real = spec[..., 0].permute(0, 2, 1)
         spec_imag = spec[..., 1].permute(0, 2, 1)
         spec_mag = torch.sqrt(spec_real ** 2 + spec_imag ** 2 + 1e-12)
-        feat = torch.stack([spec_mag, spec_real, spec_imag], dim=1)  # (B, 3, T, F)
+        feat = torch.stack([spec_mag, spec_real, spec_imag], dim=1)  # (B,3,T,257)
 
         spec_ref = spec.permute(0, 3, 2, 1)  # (B, 2, T, F)
 
-        feat = self.erb.bm(feat)
-        feat = self.sfe(feat)
+        feat = self.erb.bm(feat) # (B,3,T,129)
+        feat = self.sfe(feat)   # (B,9,T,129)
         feat, en_outs = self.encoder(feat)
-        feat = self.dpgrnn1(feat)
+
+        feat = self.film(feat, embedding)
+
+        feat = self.dpgrnn1(feat) # (B,16,T,33)
         feat = self.dpgrnn2(feat)
 
-        # 嵌入融合（在decoder输入前，feat为16通道）
-        emb_proj = self.emb_fc(embedding)  # (B, 16)
-        B, C, T, F = feat.shape
-        emb_expanded = emb_proj.unsqueeze(-1).unsqueeze(-1).expand(-1, C, T, F)
-        feat_fused = torch.cat([feat, emb_expanded], dim=1)  # (B, 32, T, F)
+        m_feat = self.decoder(feat, en_outs)
 
-        m_feat = self.decoder(feat_fused, en_outs)  # (B, 2, T, F)
-        
         m = self.erb.bs(m_feat)
 
         spec_enh = self.mask(m, spec_ref)  # (B, 2, T, F)
