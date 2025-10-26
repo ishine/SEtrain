@@ -374,70 +374,71 @@ class FiLMLayer(nn.Module):
         beta  = beta.view(B, C, 1, 1)
         return gamma * feat + beta
 
-class GTCRN(nn.Module):
-    def __init__(
-        self,
-        n_fft=512,
-        hop_len=256,
-        win_len=512
-    ):
-        super().__init__()
-        self.n_fft = n_fft
-        self.hop_len = hop_len
-        self.win_len = win_len
-        
-        self.erb = ERB(65, 64)
-        self.sfe = SFE(3, 1)
 
-        self.encoder = Encoder()
+# class GTCRN(nn.Module):
+#     def __init__(
+#         self,
+#         n_fft=512,
+#         hop_len=256,
+#         win_len=512
+#     ):
+#         super().__init__()
+#         self.n_fft = n_fft
+#         self.hop_len = hop_len
+#         self.win_len = win_len
         
-        self.dpgrnn1 = DPGRNN(16, 33, 16)
-        self.dpgrnn2 = DPGRNN(16, 33, 16)
-        
-        self.decoder = Decoder()
+#         self.erb = ERB(65, 64)
+#         self.sfe = SFE(3, 1)
 
-        self.mask = Mask()
+#         self.encoder = Encoder()
+        
+#         self.dpgrnn1 = DPGRNN(16, 33, 16)
+#         self.dpgrnn2 = DPGRNN(16, 33, 16)
+        
+#         self.decoder = Decoder()
 
-    def forward(self, x):
-        """
-        x: (B, L)
-        """
-        device = x.device
-        n_samples = x.shape[1]
-        
-        stft_kwargs = {'n_fft': self.n_fft, 'hop_length': self.hop_len, 'win_length': self.win_len,
-                       'window': torch.hann_window(self.win_len).to(device), 'onesided': True}
-        
-        spec = torch.stft(x,  **stft_kwargs, return_complex=True)
-        spec = torch.view_as_real(spec)
+#         self.mask = Mask()
 
-        spec_real = spec[..., 0].permute(0,2,1)
-        spec_imag = spec[..., 1].permute(0,2,1)
-        spec_mag = torch.sqrt(spec_real**2 + spec_imag**2 + 1e-12)
-        feat = torch.stack([spec_mag, spec_real, spec_imag], dim=1)  # (B,3,T,257)
+#     def forward(self, x):
+#         """
+#         x: (B, L)
+#         """
+#         device = x.device
+#         n_samples = x.shape[1]
         
-        spec = spec.permute(0,3,2,1)  # (B,2,T,F)
+#         stft_kwargs = {'n_fft': self.n_fft, 'hop_length': self.hop_len, 'win_length': self.win_len,
+#                        'window': torch.hann_window(self.win_len).to(device), 'onesided': True}
+        
+#         spec = torch.stft(x,  **stft_kwargs, return_complex=True)
+#         spec = torch.view_as_real(spec)
 
-        feat = self.erb.bm(feat)  # (B,3,T,129)
-        feat = self.sfe(feat)     # (B,9,T,129)
+#         spec_real = spec[..., 0].permute(0,2,1)
+#         spec_imag = spec[..., 1].permute(0,2,1)
+#         spec_mag = torch.sqrt(spec_real**2 + spec_imag**2 + 1e-12)
+#         feat = torch.stack([spec_mag, spec_real, spec_imag], dim=1)  # (B,3,T,257)
+        
+#         spec = spec.permute(0,3,2,1)  # (B,2,T,F)
 
-        feat, en_outs = self.encoder(feat)
-        
-        feat = self.dpgrnn1(feat) # (B,16,T,33)
-        feat = self.dpgrnn2(feat) # (B,16,T,33)
+#         feat = self.erb.bm(feat)  # (B,3,T,129)
+#         feat = self.sfe(feat)     # (B,9,T,129)
 
-        m_feat = self.decoder(feat, en_outs)
+#         feat, en_outs = self.encoder(feat)
         
-        m = self.erb.bs(m_feat)
+#         feat = self.dpgrnn1(feat) # (B,16,T,33)
+#         feat = self.dpgrnn2(feat) # (B,16,T,33)
 
-        spec_enh = self.mask(m, spec) # (B,2,T,F)
-        spec_enh = spec_enh.permute(0,3,2,1)  # (B,F,T,2)
+#         m_feat = self.decoder(feat, en_outs)
         
-        spec_enh = torch.complex(spec_enh[...,0], spec_enh[...,1])
-        output = torch.istft(spec_enh, **stft_kwargs)
-        output = torch.nn.functional.pad(output, (0, n_samples-output.shape[1]))
+#         m = self.erb.bs(m_feat)
+
+#         spec_enh = self.mask(m, spec) # (B,2,T,F)
+#         spec_enh = spec_enh.permute(0,3,2,1)  # (B,F,T,2)
         
-        return output
+#         spec_enh = torch.complex(spec_enh[...,0], spec_enh[...,1])
+#         output = torch.istft(spec_enh, **stft_kwargs)
+#         output = torch.nn.functional.pad(output, (0, n_samples-output.shape[1]))
+        
+#         return output
     
 class GTCRN_TSE(nn.Module):
     def __init__(self, embedding_dim=192, n_fft=512, hop_len=256, win_len=512):
@@ -483,9 +484,9 @@ class GTCRN_TSE(nn.Module):
         feat = self.sfe(feat)   # (B,9,T,129)
         feat, en_outs = self.encoder(feat)
 
+        
         feat = self.film(feat, embedding)
-
-        feat = self.dpgrnn1(feat) # (B,16,T,33)
+        feat = self.dpgrnn1(feat) # (B,16,T,33)        
         feat = self.dpgrnn2(feat)
 
         m_feat = self.decoder(feat, en_outs)
