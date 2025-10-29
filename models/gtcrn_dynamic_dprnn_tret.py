@@ -2,7 +2,6 @@
 GTCRN: ShuffleNetV2 + SFE + TRA + 2 DPGRNN
 Ultra tiny, 33.0 MMACs, 23.67 K params -> 93.28 MMac 89.429 K params ?
 """
-import math
 import torch
 import numpy as np
 import torch.nn as nn
@@ -11,6 +10,8 @@ import torch.nn.functional as F
 from torch.profiler import record_function
 
 calculate_macs_mode = False
+
+CHANNELS = 20
 
 
 class ERB(nn.Module):
@@ -282,122 +283,132 @@ class GRNN(nn.Module):
         y = torch.cat([y1, y2], dim=-1)
         h = torch.cat([h1, h2], dim=-1)
         return y, h
-
-
-class MultiheadSelfAttention(nn.Module):
-    def __init__(self, embed_dim: int, hidden_dim: int, num_heads: int, dropout: float = 0.0, bias: bool = True):
-        super().__init__()
-        self.embed_dim = embed_dim
-        self.hidden_dim = hidden_dim
-        self.num_heads = num_heads
-        self.head_dim = hidden_dim // num_heads
-
-        self.q_proj = nn.Linear(embed_dim, hidden_dim, bias=bias)
-        self.k_proj = nn.Linear(embed_dim, hidden_dim, bias=bias)
-        self.v_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
-        self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
-        self.attn_drop = nn.Dropout(dropout)
-
-    def forward(self, query: torch.Tensor, need_weights: bool = False):
-        B, N, C = query.shape  # (batch, seq_len, embed)
-        q = self.q_proj(query)
-        k = self.k_proj(query)
-        v = self.v_proj(query)
-
-        # (B, H, N, D)
-        q = q.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
-        k = k.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
-        v = v.view(B, N, self.num_heads, self.embed_dim // self.num_heads).transpose(1, 2)
-
-        attn_scores = torch.matmul(q, k.transpose(-1, -2)) / math.sqrt(self.head_dim)  # (B,H,N,N)
-        attn = torch.softmax(attn_scores, dim=-1)
-        attn = self.attn_drop(attn)
-        out = torch.matmul(attn, v)  # (B,H,N,D)
-
-        out = out.transpose(1, 2).contiguous().view(B, N, C)
-        out = self.out_proj(out)
-        if need_weights:
-            avg_weights = attn.mean(dim=1)  # (B,N,N)
-            return out, avg_weights
-        return out, None
+    
     
 class DPGRNN(nn.Module):
     """Grouped Dual-path RNN"""
-    def __init__(self, input_size, width, hidden_size, do_pre_ff=False, **kwargs):
+    def __init__(self, input_size, width, hidden_size, **kwargs):
         super(DPGRNN, self).__init__(**kwargs)
         self.input_size = input_size
         self.width = width
         self.hidden_size = hidden_size
 
-        self.do_pre_ff = do_pre_ff
-        if self.do_pre_ff:
-            self.pre_ff_ln = nn.LayerNorm(hidden_size, eps=1e-8)
-            self.pre_ff_rnn = GRNN(hidden_size, hidden_size, 1, batch_first=True, bidirectional=False)
-            self.pre_ff_act = nn.PReLU()
-            self.pre_ff_fc = nn.Linear(hidden_size, hidden_size)
-
-        self.intra_attn = MultiheadSelfAttention(embed_dim=input_size, hidden_dim=24, num_heads=4, dropout=0.0)
-        self.intra_pre_ln = nn.LayerNorm(hidden_size, eps=1e-8)
-        self.intra_post_ln = nn.LayerNorm(hidden_size, eps=1e-8)
-        self.intra_fc1 = nn.Linear(hidden_size, hidden_size)
-        self.intra_act = nn.PReLU()
-        self.intra_fc2 = nn.Linear(hidden_size, hidden_size)
-        self.intra_gru_ff = GRNN(hidden_size, hidden_size, 1, batch_first=True, bidirectional=False)
-        self.ff_act = nn.PReLU()
-        self.ff_fc = nn.Linear(hidden_size, hidden_size)
-
-        self.inter_rnn = GRNN(input_size=input_size, hidden_size=hidden_size, bidirectional=False)
-        self.inter_fc = nn.Linear(hidden_size, hidden_size)
-        self.inter_pre_ln = nn.LayerNorm(hidden_size, eps=1e-8)
+        self.intra_rnn = GRNN(input_size=input_size, hidden_size=hidden_size//2, bidirectional=True)
+        self.intra_fc = nn.Linear(hidden_size, hidden_size)
+        self.intra_ln = nn.LayerNorm((width, hidden_size), eps=1e-8)
+        # Replace inter_rnn with RetNet-style retention block (time-wise) + FFN.
+        # Retention operates over the temporal dimension independently for each frequency bin (dual-path design)
+        self.inter_block = RetNetTimeBlock(
+            d_model=hidden_size,
+            heads=4,
+            ffn_expand=1.0,
+            dropout=0.0,
+            layer_norm_eps=1e-8
+        )
+        # Removed extra inter LayerNorm as RetNet block contains necessary norms
     
     def forward(self, x):
-        """x: (B, C, T, F)"""
-        batch_size = x.shape[0]
-        x = x.permute(0, 2, 3, 1)  # (B,T,F,C)
-        x = x.reshape(x.shape[0] * x.shape[1], x.shape[2], x.shape[3])  # (B*T,F,C)
-        # Pre-feedforward: y = x + FFN(LN(x))
-        if self.do_pre_ff: 
-            pre_ff = self.pre_ff_ln(x)
-            pre_ff = self.pre_ff_rnn(pre_ff)[0]
-            x = self.pre_ff_fc(self.pre_ff_act(pre_ff)) + x
-        ## Intra Self-Attention
-        # Attention sub-layer: y = x + Attn(LN(x))
-        attn_in = self.intra_pre_ln(x)
-        attn_out = self.intra_attn(attn_in, need_weights=False)[0]  # (B*T,F,C)
-        y = x + attn_out
+        """
+        x: (B, C, T, F)
+        """
+        B, C, T, F = x.shape
+        ## Intra RNN (unchanged, bi-directional across frequency dimension per time frame)
+        xt = x.permute(0, 2, 3, 1)  # (B,T,F,C)
+        intra_x = xt.reshape(B * T, F, C)  # (B*T,F,C)
+        intra_x = self.intra_rnn(intra_x)[0]  # (B*T,F,C)
+        intra_x = self.intra_fc(intra_x)      # (B*T,F,C)
+        intra_x = intra_x.reshape(B, T, self.width, self.hidden_size)  # (B,T,F,C)
+        intra_x = self.intra_ln(intra_x)
+        intra_out = xt + intra_x  # residual
 
-        # FFN sub-layer: z = y + FFN(LN(y))
-        ffn_in = self.intra_post_ln(y)
-        ffn = self.intra_gru_ff(ffn_in)[0]
-        ffn = self.ff_fc(self.ff_act(self.intra_fc1(ffn)))
-        intra_out = y + ffn
-        intra_out = intra_out.reshape(batch_size, -1, self.width, self.hidden_size)  # (B,T,F,C)
+        ## Inter Retention (time over each frequency independently)
+        # Re-arrange to (B,F,T,C) then merge (B*F) as batch for retention block
+        inter_in = intra_out.permute(0, 2, 1, 3)  # (B,F,T,C)
+        inter_in_flat = inter_in.reshape(B * F, T, self.hidden_size)  # (B*F, T, C)
 
-        ## Inter RNN
-        x = intra_out.permute(0,2,1,3)  # (B,F,T,C)
-        inter_in = self.inter_pre_ln(x)
-        inter_x = inter_in.reshape(inter_in.shape[0] * inter_in.shape[1], inter_in.shape[2], inter_in.shape[3]) 
-        inter_x = self.inter_rnn(inter_x)[0]  # (B*F,T,C)
-        inter_x = self.inter_fc(inter_x)      # (B*F,T,C)
-        inter_x = inter_x.reshape(x.shape[0], self.width, -1, self.hidden_size) # (B,F,T,C)
-        inter_x = inter_x.permute(0,2,1,3)   # (B,T,F,C)
-        # inter_x = self.inter_ln(inter_x) 
-        inter_out = torch.add(intra_out, inter_x)
-        
-        dual_out = inter_out.permute(0,3,1,2)  # (B,C,T,F)
-        
+        inter_out_flat = self.inter_block(inter_in_flat)  # (B*F, T, C)
+
+        inter_out = inter_out_flat.reshape(B, F, T, self.hidden_size).permute(0, 2, 1, 3)  # (B,T,F,C)
+        # inter_out = intra_out + inter_out  # residual
+
+        dual_out = inter_out.permute(0, 3, 1, 2)  # (B,C,T,F)
         return dual_out
+
+
+class RetNetTimeBlock(nn.Module):
+    """A lightweight Retention-style block operating on temporal dimension for each independent sequence.
+
+    Design goals:
+    - Parallel friendly during training (simple operations over full sequence)
+    - Streaming friendly during inference with O(1) state per sequence (exponential retention)
+    - Keeps parameter count low to fit ultra-tiny model constraints
+
+    Recurrence (per feature channel):
+        s_t = decay * s_{t-1} + gate_t * value_t
+        y_t = proj_out(s_t)
+
+    Where decay is a learned (0,1) scalar per channel (passed through sigmoid).
+    gate_t = sigmoid(W_g x_t), value_t = W_v x_t.
+    Includes pre/post LayerNorm + FFN (GELU) with residual connections.
+    """
+    def __init__(self, d_model: int, heads: int = 4, ffn_expand: float = 2.0, dropout: float = 0.0, layer_norm_eps: float = 1e-8):
+        super().__init__()
+        self.d_model = d_model
+        self.heads = heads
+        assert d_model % heads == 0, "d_model must be divisible by heads"
+        self.head_dim = d_model // heads
+        inner = int(d_model * ffn_expand)
+        self.ln_in = nn.LayerNorm(d_model, eps=layer_norm_eps)
+        self.decay_param = nn.Parameter(torch.zeros(d_model))  # sigmoid -> (0,1), per-channel
+        self.gate_proj = nn.Linear(d_model, d_model)
+        self.val_proj = nn.Linear(d_model, d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+        # FFN
+        self.ln_ff = nn.LayerNorm(d_model, eps=layer_norm_eps)
+        self.ff1 = nn.Linear(d_model, inner)
+        self.ff2 = nn.Linear(inner, d_model)
+        self.act = nn.GELU()
+        self.ff_dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+
+    def forward(self, x: torch.Tensor):
+        """
+        x: (B, T, D)
+        Returns: y (B, T, D)
+        """
+        B, T, D = x.shape
+        x_norm = self.ln_in(x)
+        gate = torch.sigmoid(self.gate_proj(x_norm))  # (B,T,D)
+        val = self.val_proj(x_norm)  # (B,T,D)
+        # reshape for heads
+        gate = gate.view(B, T, self.heads, self.head_dim)
+        val = val.view(B, T, self.heads, self.head_dim)
+        decay = torch.sigmoid(self.decay_param).view(self.heads, self.head_dim)  # (H,Dh)
+
+        # Full sequence recurrence without external state
+        states = []
+        state = torch.zeros(B, self.heads, self.head_dim, device=x.device, dtype=x.dtype)
+        for t in range(T):
+            state = decay * state + gate[:, t] * val[:, t]
+            states.append(state.unsqueeze(1))  # (B,1,H,Dh)
+        s_all = torch.cat(states, dim=1)  # (B,T,H,Dh)
+        y = self.out_proj(s_all.view(B, T, D))
+        y = self.dropout(y)
+        y = y + x  # residual 1
+        y_ff = self.ff2(self.ff_dropout(self.act(self.ff1(self.ln_ff(y)))))
+        y = y + y_ff  # residual 2
+        return y
 
 
 class Encoder(nn.Module):
     def __init__(self):
         super().__init__()
         self.en_convs = nn.ModuleList([
-            ConvBlock(3*3, 16, (1,5), stride=(1,2), padding=(0,2), use_deconv=False, is_last=False),
-            ConvBlock(16, 16, (1,5), stride=(1,2), padding=(0,2), groups=2, use_deconv=False, is_last=False),
-            GTConvBlock(16, 16, (3,3), stride=(1,1), padding=(0,1), dilation=(1,1), use_deconv=False),
-            GTConvBlock(16, 16, (3,3), stride=(1,1), padding=(0,1), dilation=(2,1), use_deconv=False),
-            GTConvBlock(16, 16, (3,3), stride=(1,1), padding=(0,1), dilation=(5,1), use_deconv=False)
+            ConvBlock(3*3, CHANNELS, (1,5), stride=(1,2), padding=(0,2), use_deconv=False, is_last=False),
+            ConvBlock(CHANNELS, CHANNELS, (1,5), stride=(1,2), padding=(0,2), groups=2, use_deconv=False, is_last=False),
+            GTConvBlock(CHANNELS, CHANNELS, (3,3), stride=(1,1), padding=(0,1), dilation=(1,1), use_deconv=False),
+            GTConvBlock(CHANNELS, CHANNELS, (3,3), stride=(1,1), padding=(0,1), dilation=(2,1), use_deconv=False),
+            GTConvBlock(CHANNELS, CHANNELS, (3,3), stride=(1,1), padding=(0,1), dilation=(5,1), use_deconv=False)
         ])
 
     def forward(self, x):
@@ -412,11 +423,11 @@ class Decoder(nn.Module):
     def __init__(self):
         super().__init__()
         self.de_convs = nn.ModuleList([
-            GTConvBlock(16, 16, (3,3), stride=(1,1), padding=(5*2,1), dilation=(5,1), use_deconv=True),
-            GTConvBlock(16, 16, (3,3), stride=(1,1), padding=(2*2,1), dilation=(2,1), use_deconv=True),
-            GTConvBlock(16, 16, (3,3), stride=(1,1), padding=(1*2,1), dilation=(1,1), use_deconv=True),
-            ConvBlock(16, 16, (1,5), stride=(1,2), padding=(0,2), groups=2, use_deconv=True, is_last=False),
-            ConvBlock(16, 2, (1,5), stride=(1,2), padding=(0,2), use_deconv=True, is_last=True)
+            GTConvBlock(CHANNELS, CHANNELS, (3,3), stride=(1,1), padding=(5*2,1), dilation=(5,1), use_deconv=True),
+            GTConvBlock(CHANNELS, CHANNELS, (3,3), stride=(1,1), padding=(2*2,1), dilation=(2,1), use_deconv=True),
+            GTConvBlock(CHANNELS, CHANNELS, (3,3), stride=(1,1), padding=(1*2,1), dilation=(1,1), use_deconv=True),
+            ConvBlock(CHANNELS, CHANNELS, (1,5), stride=(1,2), padding=(0,2), groups=2, use_deconv=True, is_last=False),
+            ConvBlock(CHANNELS, 2, (1,5), stride=(1,2), padding=(0,2), use_deconv=True, is_last=True)
         ])
 
     def forward(self, x, en_outs):
@@ -455,8 +466,8 @@ class GTCRN(nn.Module):
 
         self.encoder = Encoder()
         
-        self.dpgrnn1 = DPGRNN(16, 33, 16, do_pre_ff=True)
-        self.dpgrnn2 = DPGRNN(16, 33, 16)
+        self.dpgrnn1 = DPGRNN(CHANNELS, 33, CHANNELS)
+        self.dpgrnn2 = DPGRNN(CHANNELS, 33, CHANNELS)
         
         self.decoder = Decoder()
 
@@ -487,8 +498,8 @@ class GTCRN(nn.Module):
 
         feat, en_outs = self.encoder(feat)
         
-        feat = self.dpgrnn1(feat) # (B,16,T,33)
-        feat = self.dpgrnn2(feat) # (B,16,T,33)
+        feat = self.dpgrnn1(feat) # (B,CHANNELS,T,33)
+        feat = self.dpgrnn2(feat) # (B,CHANNELS,T,33)
 
         m_feat = self.decoder(feat, en_outs)
         
@@ -510,12 +521,15 @@ if __name__ == "__main__":
 
     """complexity count"""
     from ptflops import get_model_complexity_info
-    flops, params = get_model_complexity_info(model, (16000,), as_strings=True,
-                                            print_per_layer_stat=True, verbose=False, backend='aten')
-    params = 0
-    for p in model.parameters():
-        params += p.numel()
-    print(flops, params/1e3)
+    try:
+        flops, params = get_model_complexity_info(model, (16000,), as_strings=True,
+                                                print_per_layer_stat=True, verbose=False, backend='aten')
+        params = 0
+        for p in model.parameters():
+            params += p.numel()
+        print(flops, params/1e3)
+    except ValueError:
+        pass
 
     """causality check"""
     a = torch.randn(1, 16000)

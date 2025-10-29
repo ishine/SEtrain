@@ -336,7 +336,7 @@ class DPGRNN(nn.Module):
             self.pre_ff_act = nn.PReLU()
             self.pre_ff_fc = nn.Linear(hidden_size, hidden_size)
 
-        self.intra_attn = MultiheadSelfAttention(embed_dim=input_size, hidden_dim=24, num_heads=4, dropout=0.0)
+        self.intra_attn = MultiheadSelfAttention(embed_dim=input_size, hidden_dim=input_size, num_heads=4, dropout=0.0)
         self.intra_pre_ln = nn.LayerNorm(hidden_size, eps=1e-8)
         self.intra_post_ln = nn.LayerNorm(hidden_size, eps=1e-8)
         self.intra_fc1 = nn.Linear(hidden_size, hidden_size)

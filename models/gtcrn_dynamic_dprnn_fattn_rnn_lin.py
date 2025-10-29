@@ -284,17 +284,20 @@ class GRNN(nn.Module):
         return y, h
 
 
-class MultiheadSelfAttention(nn.Module):
-    def __init__(self, embed_dim: int, hidden_dim: int, num_heads: int, dropout: float = 0.0, bias: bool = True):
+class MultiheadSelfAttentionLoR(nn.Module):
+    def __init__(self, embed_dim: int, hidden_dim: int, num_heads: int, rank: int, seq_len: int, dropout: float = 0.0, bias: bool = True):
         super().__init__()
         self.embed_dim = embed_dim
         self.hidden_dim = hidden_dim
         self.num_heads = num_heads
         self.head_dim = hidden_dim // num_heads
+        self.rank = rank
 
         self.q_proj = nn.Linear(embed_dim, hidden_dim, bias=bias)
         self.k_proj = nn.Linear(embed_dim, hidden_dim, bias=bias)
+        self.k_proj_lo = nn.Linear(seq_len, rank, bias=bias)
         self.v_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+        self.v_proj_lo = nn.Linear(seq_len, rank, bias=bias)
         self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
         self.attn_drop = nn.Dropout(dropout)
 
@@ -302,12 +305,14 @@ class MultiheadSelfAttention(nn.Module):
         B, N, C = query.shape  # (batch, seq_len, embed)
         q = self.q_proj(query)
         k = self.k_proj(query)
+        k = self.k_proj_lo(k.transpose(1,2)).transpose(1,2)  # (B,rank,N)
         v = self.v_proj(query)
+        v = self.v_proj_lo(v.transpose(1,2)).transpose(1,2)  # (B,rank,N)
 
         # (B, H, N, D)
         q = q.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
-        k = k.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
-        v = v.view(B, N, self.num_heads, self.embed_dim // self.num_heads).transpose(1, 2)
+        k = k.view(B, self.rank, self.num_heads, self.head_dim).transpose(1, 2)
+        v = v.view(B, self.rank, self.num_heads, self.embed_dim // self.num_heads).transpose(1, 2)
 
         attn_scores = torch.matmul(q, k.transpose(-1, -2)) / math.sqrt(self.head_dim)  # (B,H,N,N)
         attn = torch.softmax(attn_scores, dim=-1)
@@ -336,7 +341,7 @@ class DPGRNN(nn.Module):
             self.pre_ff_act = nn.PReLU()
             self.pre_ff_fc = nn.Linear(hidden_size, hidden_size)
 
-        self.intra_attn = MultiheadSelfAttention(embed_dim=input_size, hidden_dim=24, num_heads=4, dropout=0.0)
+        self.intra_attn = MultiheadSelfAttentionLoR(embed_dim=input_size, hidden_dim=24, num_heads=4, rank=10, seq_len=width, dropout=0.0)
         self.intra_pre_ln = nn.LayerNorm(hidden_size, eps=1e-8)
         self.intra_post_ln = nn.LayerNorm(hidden_size, eps=1e-8)
         self.intra_fc1 = nn.Linear(hidden_size, hidden_size)

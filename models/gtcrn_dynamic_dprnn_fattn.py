@@ -9,7 +9,9 @@ import torch.nn as nn
 from einops import rearrange
 import torch.nn.functional as F
 from torch.profiler import record_function
+from gtcrn_dynamic_dprnn_fattn_rnn import MultiheadSelfAttention
 
+calculate_macs_mode = False
 
 class ERB(nn.Module):
     def __init__(self, erb_subband_1, erb_subband_2, nfft=512, high_lim=8000, fs=16000):
@@ -188,8 +190,12 @@ class Conv2dAttention(nn.Module):
     
     def forward(self, x, attention):
         if self.use_deconv:
-            return self.deconv_and_sum(x, attention)
-        return self.conv_and_sum(x, attention)
+            if not calculate_macs_mode:
+                return self.deconv_and_sum(x, attention)
+            return self.deconv(x, attention)
+        if not calculate_macs_mode:
+            return self.conv_and_sum(x, attention)
+        return self.conv(x, attention)
 
 
 class GTConvBlock(nn.Module):
@@ -303,7 +309,7 @@ class DPGRNN(nn.Module):
         self.hidden_size = hidden_size
 
         self.pos_enc = PositionalEncoding(d_model=input_size, dropout=0, max_len=500)
-        self.intra_attn = nn.MultiheadAttention(embed_dim=input_size, num_heads=2, batch_first=True)
+        self.intra_attn = MultiheadSelfAttention(embed_dim=input_size, num_heads=4, hidden_dim=input_size)
         self.intra_fc = nn.Linear(hidden_size, hidden_size)
         self.intra_pre_ln = nn.LayerNorm(hidden_size, eps=1e-8)
         self.intra_post_ln = nn.LayerNorm((width, hidden_size), eps=1e-8)
@@ -323,7 +329,7 @@ class DPGRNN(nn.Module):
         x = self.intra_pre_ln(x)
         intra_x = x.reshape(x.shape[0] * x.shape[1], x.shape[2], x.shape[3])  # (B*T,F,C)
         intra_x = self.pos_enc(intra_x)
-        intra_x = self.intra_attn(intra_x, intra_x, intra_x, need_weights=False)[0]  # (B*T,F,C)
+        intra_x = self.intra_attn(intra_x, need_weights=False)[0]  # (B*T,F,C)
         intra_x = intra_x.reshape(x.shape[0], -1, self.width, self.hidden_size) # (B,T,F,C)
         intra_x = self.intra_pre_ln(intra_x) + residue
         residue = intra_x
@@ -464,6 +470,7 @@ class GTCRN(nn.Module):
 
 
 if __name__ == "__main__":
+    calculate_macs_mode = True
     model = GTCRN().eval()
 
     """complexity count"""

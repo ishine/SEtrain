@@ -284,6 +284,24 @@ class GRNN(nn.Module):
         return y, h
 
 
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model: int, dropout: float = 0, max_len: int = 500):
+        super().__init__()
+        self.dropout = nn.Dropout(p=dropout)
+
+        # 创建一个足够大的PE矩阵，以便容纳最长序列
+        position = torch.arange(max_len).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
+        pe = torch.zeros(1, max_len, d_model)
+        pe[0, :, 0::2] = torch.sin(position * div_term)
+        pe[0, :, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x + self.pe[:, :x.size(1), :]
+        return self.dropout(x)
+
+
 class MultiheadSelfAttention(nn.Module):
     def __init__(self, embed_dim: int, hidden_dim: int, num_heads: int, dropout: float = 0.0, bias: bool = True):
         super().__init__()
@@ -336,6 +354,7 @@ class DPGRNN(nn.Module):
             self.pre_ff_act = nn.PReLU()
             self.pre_ff_fc = nn.Linear(hidden_size, hidden_size)
 
+        self.pos_enc = PositionalEncoding(d_model=input_size, dropout=0, max_len=500)
         self.intra_attn = MultiheadSelfAttention(embed_dim=input_size, hidden_dim=24, num_heads=4, dropout=0.0)
         self.intra_pre_ln = nn.LayerNorm(hidden_size, eps=1e-8)
         self.intra_post_ln = nn.LayerNorm(hidden_size, eps=1e-8)
@@ -368,6 +387,7 @@ class DPGRNN(nn.Module):
 
         # FFN sub-layer: z = y + FFN(LN(y))
         ffn_in = self.intra_post_ln(y)
+        ffn_in = self.pos_enc(ffn_in)
         ffn = self.intra_gru_ff(ffn_in)[0]
         ffn = self.ff_fc(self.ff_act(self.intra_fc1(ffn)))
         intra_out = y + ffn

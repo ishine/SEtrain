@@ -12,7 +12,6 @@ from torch.profiler import record_function
 
 calculate_macs_mode = False
 
-
 class ERB(nn.Module):
     def __init__(self, erb_subband_1, erb_subband_2, nfft=512, high_lim=8000, fs=16000):
         super().__init__()
@@ -282,24 +281,41 @@ class GRNN(nn.Module):
         y = torch.cat([y1, y2], dim=-1)
         h = torch.cat([h1, h2], dim=-1)
         return y, h
+    
+class ConcatPositionalEncoding(nn.Module):
+    def __init__(self, concat_d: int, dropout: float = 0, seq_len: int = 8):
+        super().__init__()
+        self.dropout = nn.Dropout(p=dropout)
 
+        position = torch.arange(seq_len).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, concat_d, 2) * (-math.log(10000.0) / concat_d))
+        pe = torch.zeros(1, seq_len, concat_d)
+        pe[0, :, 0::2] = torch.sin(position * div_term)
+        pe[0, :, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe)
 
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        pe = torch.cat([self.pe] * (x.size(0)), dim=0)
+        x = torch.cat((x, pe), dim=-1)
+        return self.dropout(x)
+    
 class MultiheadSelfAttention(nn.Module):
-    def __init__(self, embed_dim: int, hidden_dim: int, num_heads: int, dropout: float = 0.0, bias: bool = True):
+    def __init__(self, embed_dim: int, hidden_dim: int, out_dim: int, num_heads: int, dropout: float = 0.0, bias: bool = True):
         super().__init__()
         self.embed_dim = embed_dim
         self.hidden_dim = hidden_dim
         self.num_heads = num_heads
         self.head_dim = hidden_dim // num_heads
+        self.out_dim = out_dim
 
         self.q_proj = nn.Linear(embed_dim, hidden_dim, bias=bias)
         self.k_proj = nn.Linear(embed_dim, hidden_dim, bias=bias)
-        self.v_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
-        self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+        self.v_proj = nn.Linear(embed_dim, out_dim, bias=bias)
+        self.out_proj = nn.Linear(out_dim, out_dim, bias=bias)
         self.attn_drop = nn.Dropout(dropout)
 
     def forward(self, query: torch.Tensor, need_weights: bool = False):
-        B, N, C = query.shape  # (batch, seq_len, embed)
+        B, N, _ = query.shape  # (batch, seq_len, embed)
         q = self.q_proj(query)
         k = self.k_proj(query)
         v = self.v_proj(query)
@@ -307,14 +323,14 @@ class MultiheadSelfAttention(nn.Module):
         # (B, H, N, D)
         q = q.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
         k = k.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
-        v = v.view(B, N, self.num_heads, self.embed_dim // self.num_heads).transpose(1, 2)
+        v = v.view(B, N, self.num_heads, self.out_dim // self.num_heads).transpose(1, 2)
 
         attn_scores = torch.matmul(q, k.transpose(-1, -2)) / math.sqrt(self.head_dim)  # (B,H,N,N)
         attn = torch.softmax(attn_scores, dim=-1)
         attn = self.attn_drop(attn)
         out = torch.matmul(attn, v)  # (B,H,N,D)
 
-        out = out.transpose(1, 2).contiguous().view(B, N, C)
+        out = out.transpose(1, 2).contiguous().view(B, N, self.out_dim)
         out = self.out_proj(out)
         if need_weights:
             avg_weights = attn.mean(dim=1)  # (B,N,N)
@@ -323,65 +339,51 @@ class MultiheadSelfAttention(nn.Module):
     
 class DPGRNN(nn.Module):
     """Grouped Dual-path RNN"""
-    def __init__(self, input_size, width, hidden_size, do_pre_ff=False, **kwargs):
+    def __init__(self, input_size, width, hidden_size, **kwargs):
         super(DPGRNN, self).__init__(**kwargs)
         self.input_size = input_size
         self.width = width
         self.hidden_size = hidden_size
 
-        self.do_pre_ff = do_pre_ff
-        if self.do_pre_ff:
-            self.pre_ff_ln = nn.LayerNorm(hidden_size, eps=1e-8)
-            self.pre_ff_rnn = GRNN(hidden_size, hidden_size, 1, batch_first=True, bidirectional=False)
-            self.pre_ff_act = nn.PReLU()
-            self.pre_ff_fc = nn.Linear(hidden_size, hidden_size)
-
-        self.intra_attn = MultiheadSelfAttention(embed_dim=input_size, hidden_dim=24, num_heads=4, dropout=0.0)
+        self.pos_enc = ConcatPositionalEncoding(concat_d=8, dropout=0, seq_len=width)
+        self.intra_attn = MultiheadSelfAttention(embed_dim=input_size+8, hidden_dim=24, out_dim=input_size, num_heads=4)
+        self.intra_fc = nn.Linear(hidden_size, hidden_size)
         self.intra_pre_ln = nn.LayerNorm(hidden_size, eps=1e-8)
-        self.intra_post_ln = nn.LayerNorm(hidden_size, eps=1e-8)
+        self.intra_post_ln = nn.LayerNorm((width, hidden_size), eps=1e-8)
         self.intra_fc1 = nn.Linear(hidden_size, hidden_size)
         self.intra_act = nn.PReLU()
         self.intra_fc2 = nn.Linear(hidden_size, hidden_size)
-        self.intra_gru_ff = GRNN(hidden_size, hidden_size, 1, batch_first=True, bidirectional=False)
-        self.ff_act = nn.PReLU()
-        self.ff_fc = nn.Linear(hidden_size, hidden_size)
 
         self.inter_rnn = GRNN(input_size=input_size, hidden_size=hidden_size, bidirectional=False)
         self.inter_fc = nn.Linear(hidden_size, hidden_size)
-        self.inter_pre_ln = nn.LayerNorm(hidden_size, eps=1e-8)
+        self.inter_ln = nn.LayerNorm(((width, hidden_size)), eps=1e-8)
     
     def forward(self, x):
         """x: (B, C, T, F)"""
-        batch_size = x.shape[0]
-        x = x.permute(0, 2, 3, 1)  # (B,T,F,C)
-        x = x.reshape(x.shape[0] * x.shape[1], x.shape[2], x.shape[3])  # (B*T,F,C)
-        # Pre-feedforward: y = x + FFN(LN(x))
-        if self.do_pre_ff: 
-            pre_ff = self.pre_ff_ln(x)
-            pre_ff = self.pre_ff_rnn(pre_ff)[0]
-            x = self.pre_ff_fc(self.pre_ff_act(pre_ff)) + x
         ## Intra Self-Attention
-        # Attention sub-layer: y = x + Attn(LN(x))
-        attn_in = self.intra_pre_ln(x)
-        attn_out = self.intra_attn(attn_in, need_weights=False)[0]  # (B*T,F,C)
-        y = x + attn_out
-
-        # FFN sub-layer: z = y + FFN(LN(y))
-        ffn_in = self.intra_post_ln(y)
-        ffn = self.intra_gru_ff(ffn_in)[0]
-        ffn = self.ff_fc(self.ff_act(self.intra_fc1(ffn)))
-        intra_out = y + ffn
-        intra_out = intra_out.reshape(batch_size, -1, self.width, self.hidden_size)  # (B,T,F,C)
+        x = x.permute(0, 2, 3, 1)  # (B,T,F,C)
+        residue = x
+        x = self.intra_pre_ln(x)
+        intra_x = x.reshape(x.shape[0] * x.shape[1], x.shape[2], x.shape[3])  # (B*T,F,C)
+        intra_x = self.pos_enc(intra_x)
+        intra_x = self.intra_attn(intra_x, need_weights=False)[0]  # (B*T,F,C)
+        intra_x = intra_x.reshape(x.shape[0], -1, self.width, self.hidden_size) # (B,T,F,C)
+        intra_x = self.intra_pre_ln(intra_x) + residue
+        residue = intra_x
+        intra_x = self.intra_fc1(intra_x)
+        intra_x = self.intra_act(intra_x)
+        intra_x = self.intra_fc2(intra_x)
+        intra_x = self.intra_post_ln(intra_x)
+        intra_out = torch.add(intra_x, residue)
 
         ## Inter RNN
         x = intra_out.permute(0,2,1,3)  # (B,F,T,C)
-        inter_in = self.inter_pre_ln(x)
-        inter_x = inter_in.reshape(inter_in.shape[0] * inter_in.shape[1], inter_in.shape[2], inter_in.shape[3]) 
+        inter_x = x.reshape(x.shape[0] * x.shape[1], x.shape[2], x.shape[3]) 
         inter_x = self.inter_rnn(inter_x)[0]  # (B*F,T,C)
         inter_x = self.inter_fc(inter_x)      # (B*F,T,C)
         inter_x = inter_x.reshape(x.shape[0], self.width, -1, self.hidden_size) # (B,F,T,C)
         inter_x = inter_x.permute(0,2,1,3)   # (B,T,F,C)
-        # inter_x = self.inter_ln(inter_x) 
+        inter_x = self.inter_ln(inter_x) 
         inter_out = torch.add(intra_out, inter_x)
         
         dual_out = inter_out.permute(0,3,1,2)  # (B,C,T,F)
@@ -455,7 +457,7 @@ class GTCRN(nn.Module):
 
         self.encoder = Encoder()
         
-        self.dpgrnn1 = DPGRNN(16, 33, 16, do_pre_ff=True)
+        self.dpgrnn1 = DPGRNN(16, 33, 16)
         self.dpgrnn2 = DPGRNN(16, 33, 16)
         
         self.decoder = Decoder()
