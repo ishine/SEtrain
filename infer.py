@@ -4,7 +4,10 @@ import torch
 import soundfile as sf
 from tqdm import tqdm
 from omegaconf import OmegaConf
-from models.gtcrn_dynamic_end2end import GTCRN as Model
+import models.gtcrn_dynamic_clean as module
+from models.gtcrn_dynamic_clean import GTCRN as Model
+
+module.calculate_macs_mode = True
 
 def main(args):
     cfg_infer = OmegaConf.load(args.config)

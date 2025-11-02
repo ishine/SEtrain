@@ -11,11 +11,135 @@ import numpy as np
 import torch.nn as nn
 from einops import rearrange
 import torch.nn.functional as F
+import math
 from torch.profiler import record_function
+from typing import Tuple, Optional
 
 calculate_macs_mode = False
 CHANNELS = 16
 
+
+def partial_conv2d_w_functional(
+    input_tensor: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    kernel_size: Tuple[int, int],
+    stride: Tuple[int, int],
+    padding: Tuple[int, int],
+    dilation: Tuple[int, int],
+    groups: int,
+    out_w_start: int,
+    out_w_end: int
+) -> torch.Tensor:
+    """
+    以函数式的方式，仅计算二维卷积在W维度上特定输出范围的结果。
+    此版本通过手动padding解决了所有边界条件下的尺寸问题。
+    """
+    if out_w_start > out_w_end:
+        raise ValueError("out_w_start cannot be greater than out_w_end.")
+
+    W_in = input_tensor.shape[3]
+    kernel_h, kernel_w = kernel_size
+    stride_h, stride_w = stride
+    padding_h, padding_w = padding
+    dilation_h, dilation_w = dilation
+    
+    # 1. 计算理论上需要的输入窗口的全局索引
+    in_w_start = out_w_start * stride_w - padding_w
+    in_w_end = (out_w_end * stride_w - padding_w) + (kernel_w - 1) * dilation_w
+
+    # 2. 从输入张量中切出实际存在的部分
+    slice_w_start = max(0, in_w_start)
+    slice_w_end = min(W_in, in_w_end + 1)
+    
+    # 如果所需范围完全在输入张量之外，则提前返回空张量
+    if slice_w_start >= slice_w_end and (in_w_start >= W_in or in_w_end < 0):
+         H_out = math.floor((input_tensor.shape[2] + 2 * padding_h - dilation_h * (kernel_h - 1) - 1) / stride_h + 1)
+         C_out = weight.shape[0]
+         return torch.empty(
+             input_tensor.shape[0], C_out, H_out, 0,
+             device=input_tensor.device, dtype=input_tensor.dtype
+         )
+
+    input_slice = input_tensor[:, :, :, slice_w_start:slice_w_end]
+    
+    # 3. 计算需要在切片左右两侧手动补充的 padding
+    left_pad = slice_w_start - in_w_start
+    right_pad = (in_w_end + 1) - slice_w_end
+    
+    # 4. 使用 F.pad 进行精确的手动填充
+    # F.pad 的填充顺序是 (左, 右, 上, 下)
+    padded_input = F.pad(input_slice, (left_pad, right_pad, 0, 0))
+    
+    # 5. 使用 F.conv2d 进行计算，此时水平padding必须为0，垂直padding保持不变
+    # 因为水平方向的padding已经手动完成了
+    output_slice = F.conv2d(
+        padded_input, weight, bias, stride, padding=(padding_h, 0), 
+        dilation=dilation, groups=groups
+    )
+    
+    return output_slice
+
+
+def partial_conv_transpose2d_w_functional(
+    input_tensor: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    kernel_size: Tuple[int, int],
+    stride: Tuple[int, int],
+    padding: Tuple[int, int],
+    output_padding: Tuple[int, int],
+    dilation: Tuple[int, int],
+    groups: int,
+    out_w_start: int,
+    out_w_end: int
+) -> torch.Tensor:
+    """
+    以函数式的方式，仅计算二维转置卷积在W维度上特定输出范围的结果。
+    """
+    if out_w_start > out_w_end:
+        raise ValueError("out_w_start cannot be greater than out_w_end.")
+
+    W_in = input_tensor.shape[3]
+    kernel_h, kernel_w = kernel_size
+    stride_h, stride_w = stride
+    padding_h, padding_w = padding
+    dilation_h, dilation_w = dilation
+    out_padding_h, out_padding_w = output_padding
+    
+    in_w_end = math.floor((out_w_end + padding_w) / stride_w)
+    numerator = out_w_start + padding_w - (kernel_w - 1) * dilation_w
+    in_w_start = math.ceil(numerator / stride_w)
+    
+    in_w_start, in_w_end = int(in_w_start), int(in_w_end)
+
+    slice_w_start = max(0, in_w_start)
+    slice_w_end = min(W_in, in_w_end + 1)
+
+    if slice_w_start >= slice_w_end:
+        H_out = (input_tensor.shape[2] - 1) * stride_h - 2 * padding_h + dilation_h * (kernel_h - 1) + out_padding_h + 1
+        C_out = weight.shape[1] * groups # In conv_transpose, out_channels is at index 1
+        return torch.empty(
+            input_tensor.shape[0], C_out, H_out, 0,
+            device=input_tensor.device, dtype=input_tensor.dtype
+        )
+        
+    input_slice = input_tensor[:, :, :, slice_w_start:slice_w_end]
+
+    full_slice_output = F.conv_transpose2d(
+        input_slice, weight, bias, stride, padding,
+        output_padding, groups, dilation
+    )
+
+    output_origin_offset = slice_w_start * stride_w
+    
+    relative_start = out_w_start - output_origin_offset
+    relative_end = out_w_end - output_origin_offset
+
+    final_start = max(0, relative_start)
+    final_end = min(full_slice_output.shape[3], relative_end + 1)
+    
+    return full_slice_output[:, :, :, final_start:final_end]
 
 class ERB(nn.Module):
     def __init__(self, erb_subband_1, erb_subband_2, nfft=512, high_lim=8000, fs=16000):
@@ -172,7 +296,7 @@ class BConvBlock(nn.Module):
         nn.init.kaiming_normal_(self.candidates)
         nn.init.zeros_(self.candidates_bias)
 
-        att = self._make_equal_band_attention(self.num_bands, self.f_out)  # (K, F_out)
+        att, self.f_slices = self._make_equal_band_attention(self.num_bands, self.f_out)  # (K, F_out)
         self.register_buffer("att", att, persistent=False)
 
         self.bn = nn.BatchNorm2d(out_channels)
@@ -186,12 +310,14 @@ class BConvBlock(nn.Module):
             sizes[i] += 1
         att = torch.zeros(num_bands, f_out, dtype=torch.float32)
         start = 0
+        f_slices = []
         for b, sz in enumerate(sizes):
             end = start + sz
             if sz > 0:
                 att[b, start:end] = 1.0
+            f_slices.append((start, end-1))
             start = end
-        return att
+        return att, f_slices  # att: (K, F_out)
 
     def _conv_and_select(self, x):
         # weights: (K, I, O, kT, kF) -> (O*K, I, kT, kF)
@@ -206,6 +332,24 @@ class BConvBlock(nn.Module):
         out_all = out_all.view(B, O, K, T, Fout)
         att = self.att.to(out_all.dtype)  # (K, Fout)
         out = torch.einsum("b o k t f, k f -> b o t f", out_all, att)
+        return out
+
+    def _conv(self, x):
+        out_slices = []
+        for idx, f_slice in enumerate(self.f_slices):
+            out_slice = partial_conv2d_w_functional(
+                x,
+                self.candidates[idx].transpose(0,1),
+                self.candidates_bias[idx],
+                self.kernel_size,
+                self.stride,
+                self.padding,
+                (1, 1),
+                self.groups,
+                *f_slice
+            )
+            out_slices.append(out_slice)
+        out = torch.cat(out_slices, dim=-1)
         return out
 
     def _deconv_and_select(self, x):
@@ -223,8 +367,33 @@ class BConvBlock(nn.Module):
         att = self.att.to(out_all.dtype)  # (K, Fout)
         out = torch.einsum("b o k t f, k f -> b o t f", out_all, att)
         return out
+    
+    def _deconv(self, x):
+        out_slices = []
+        for idx, f_slice in enumerate(self.f_slices):
+            out_slice = partial_conv_transpose2d_w_functional(
+                x,
+                self.candidates[idx].transpose(0,1),
+                self.candidates_bias[idx],
+                self.kernel_size,
+                self.stride,
+                self.padding,
+                (0, 0),
+                (1, 1),
+                self.groups,
+                *f_slice
+            )
+            out_slices.append(out_slice)
+        out = torch.cat(out_slices, dim=-1)
+        return out
 
     def forward(self, x):
+        if calculate_macs_mode:
+            if self.use_deconv:
+                out = self._deconv(x)
+            else:
+                out = self._conv(x)
+            return self.act(self.bn(out))
         if self.use_deconv:
             out = self._deconv_and_select(x)
         else:
@@ -257,8 +426,47 @@ class BConv2dAttention(nn.Module):
         nn.init.zeros_(self.candidates_bias)
 
         self.f_band = f_band
-        f_att = self._make_equal_band_attention(self.f_band, f_out)  # (K, F_out)
+        f_att, self.f_slices = self._make_equal_band_attention(self.f_band, f_out)  # (K, F_out)
         self.register_buffer("f_att", f_att, persistent=False)
+
+    @staticmethod
+    def _conv(x, candidates, bias, stride, padding, groups, dilation, f_band):
+        out_slices = []
+        for idx, f_slice in enumerate(f_band):
+            out_slice = partial_conv2d_w_functional(
+                x,
+                candidates[idx],
+                bias[idx],
+                candidates.shape[-2:],
+                stride,
+                padding,
+                dilation,
+                groups,
+                *f_slice
+            )
+            out_slices.append(out_slice)
+        out = torch.cat(out_slices, dim=-1)
+        return out
+    
+    @staticmethod
+    def _deconv(x, candidates, bias, stride, padding, groups, dilation, f_band):
+        out_slices = []
+        for idx, f_slice in enumerate(f_band):
+            out_slice = partial_conv_transpose2d_w_functional(
+                x,
+                candidates[idx],
+                bias[idx],
+                candidates.shape[-2:],
+                stride,
+                padding,
+                (0, 0),
+                dilation,
+                groups,
+                *f_slice
+            )
+            out_slices.append(out_slice)
+        out = torch.cat(out_slices, dim=-1)
+        return out
 
     @staticmethod
     def _make_equal_band_attention(num_bands: int, f_out: int):
@@ -268,12 +476,14 @@ class BConv2dAttention(nn.Module):
             sizes[i] += 1
         att = torch.zeros(num_bands, f_out, dtype=torch.float32)
         start = 0
+        f_slices = []
         for b, sz in enumerate(sizes):
             end = start + sz
             if sz > 0:
                 att[b, start:end] = 1.0
+            f_slices.append((start, end-1))
             start = end
-        return att
+        return att, f_slices  # att: (K, F_out)
     
     def conv_and_sum(self, x, attention):
         x_pad = F.pad(x, [0, 0, self.pad_left, 0])  # pad left for causality
@@ -298,16 +508,50 @@ class BConv2dAttention(nn.Module):
         out = torch.einsum("b o k t f, b k t f -> b o t f", out, tf_attention)
         return out
     
+    def conv(self, x, attention):
+        x_pad = F.pad(x, [0, 0, self.pad_left, 0])  # pad left for causality
+        unfolded = F.unfold(x_pad, (self.kernel_size[0], 1), dilation=(self.dilation[0], 1), padding=(self.padding[0], 0), stride=(self.stride[0], 1))
+        unfolded2 = rearrange(unfolded, "b (c p) (t f) -> 1 (b t c) p f", c=x.shape[1], p=self.kernel_size[0], t=x.shape[2], f=x.shape[3])
+        # x: (B, C, T, F)
+        # unfolded: (B, C * K_T, T * F) -> (1, B*T*C, K_T, F)
+        # attention: (B, K, T)
+        candidates = rearrange(self.candidates, "(k l) i o p q -> l k i o p q", l=self.f_band)
+        grouped_kernels = torch.einsum("lkiopq, bkt -> lbtiopq", candidates, attention)
+        grouped_kernels = rearrange(grouped_kernels, "l b t i o p q -> l (b t o) i p q")
+        candidates_bias = rearrange(self.candidates_bias, "(k l) o -> l k o", l=self.f_band)
+        grouped_bias = torch.einsum("lko, bkt -> lbto", candidates_bias, attention)
+        grouped_bias = rearrange(grouped_bias, "l b t o -> l (b t o)")
+        out = BConv2dAttention._conv(unfolded2, grouped_kernels, bias=grouped_bias, stride=self.stride, padding=(0, self.padding[1]), groups=x.shape[0]*x.shape[2]*self.groups,
+                                     dilation=(1, 1), f_band=self.f_slices)
+        out = rearrange(out, "1 (b t o) 1 f -> b o t f", b=x.shape[0], t=x.shape[2], o=self.out_channels)
+        return out
+     
+    def deconv(self, x, attention):
+        x_pad = F.pad(x, [0, 0, self.pad_left, 0])  # pad left for causality
+        unfolded = F.unfold(x_pad, (self.kernel_size[0] * self.dilation[0] - self.dilation[0] + 1, 1), dilation=(1, 1), padding=(0, 0), stride=(self.stride[0], 1))
+        unfolded2 = rearrange(unfolded, "b (c p) (t f) -> 1 (b t c) p f", c=x.shape[1], p=self.kernel_size[0] * self.dilation[0] - self.dilation[0] + 1, t=x.shape[2], f=x.shape[3])
+        # x: (B, C, T, F)
+        # unfolded: (B, C * K_T, T * F) -> (1, B*T*C, K_T, F)
+        # attention: (B, K, T)
+        candidates = rearrange(self.candidates, "(k l) i o p q -> l k i o p q", l=self.f_band)
+        grouped_kernels = torch.einsum("lkiopq, bkt -> lbtiopq", candidates, attention)
+        grouped_kernels = rearrange(grouped_kernels, "l b t i o p q -> l (b t o) i p q")
+        candidates_bias = rearrange(self.candidates_bias, "(k l) o -> l k o", l=self.f_band)
+        grouped_bias = torch.einsum("lko, bkt -> lbto", candidates_bias, attention)
+        grouped_bias = rearrange(grouped_bias, "l b t o -> l (b t o)")
+        out = BConv2dAttention._deconv(unfolded2, grouped_kernels, bias=grouped_bias, stride=self.stride, padding=self.padding, groups=x.shape[0]*x.shape[2]*self.groups, dilation=self.dilation, 
+                                       f_band=self.f_slices)
+        out = rearrange(out, "1 (b t o) 1 f -> b o t f", b=x.shape[0], t=x.shape[2], o=self.out_channels)
+        return out
+    
     def forward(self, x, attention):
         if self.use_deconv:
             if not calculate_macs_mode:
                 return self.deconv_and_sum(x, attention)
-            print("Warning: MACs calculation mode not yet implemented for deconv BConv2dAttention.")
-            return self.deconv_and_sum(x, attention)
+            return self.deconv(x, attention)
         if not calculate_macs_mode:
             return self.conv_and_sum(x, attention)
-        print("Warning: MACs calculation mode not yet implemented for conv BConv2dAttention.")
-        return self.conv_and_sum(x, attention)
+        return self.conv(x, attention)
 
 
 class GTConvBlock(nn.Module):
