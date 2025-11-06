@@ -16,9 +16,9 @@ import torch.distributed as dist
 from torch.utils.tensorboard import SummaryWriter
 from distributed_utils import reduce_value
 
-from models.gtcrn_end2end import GTCRN as Model
+from models.gtcrn_end2end import GTCRN_TSE as Model
 from loss_factory import HybridLoss as Loss
-from dataloader_dns3 import DNS3Dataset as Dataset
+from dataloader import DNS3Dataset as Dataset
 from scheduler import LinearWarmupCosineAnnealingLR as WarmupLR
 
 seed = 43
@@ -183,12 +183,15 @@ class Trainer:
             self.train_dataloader.dataset.sample_data_per_epoch()
         self.train_bar = tqdm(self.train_dataloader, ncols=110)
 
-        for step, (noisy, clean) in enumerate(self.train_bar, 1):
+        for step, (noisy, clean, embedding) in enumerate(self.train_bar, 1):
+        # for step, (noisy, clean) in enumerate(self.train_bar, 1):
             noisy = noisy.to(self.device)
-            clean = clean.to(self.device)  
-            
-            enhanced = self.model(noisy)
-                
+            clean = clean.to(self.device)
+            ### add embedding vector
+            embedding = embedding.to(self.device) if 'embedding' in locals() else None
+
+            enhanced = self.model(noisy, embedding) if embedding is not None else self.model(noisy)
+
             loss = self.loss_func(enhanced, clean)
             if self.world_size > 1:
                 loss = reduce_value(loss)
@@ -221,11 +224,13 @@ class Trainer:
         total_pesq_score = 0
 
         self.validation_bar = tqdm(self.validation_dataloader, ncols=123)
-        for step, (noisy, clean) in enumerate(self.validation_bar, 1):
+        for step, (noisy, clean, embedding) in enumerate(self.validation_bar, 1):
             noisy = noisy.to(self.device)
-            clean = clean.to(self.device)  
-            
-            enhanced = self.model(noisy)
+            clean = clean.to(self.device)
+            ### add embedding vector
+            embedding = embedding.to(self.device) if 'embedding' in locals() else None  
+
+            enhanced = self.model(noisy, embedding) if embedding is not None else self.model(noisy)
 
             loss = self.loss_func(enhanced, clean)
             if self.world_size > 1:
@@ -281,16 +286,18 @@ class Trainer:
             self._train_epoch(epoch)
 
             self._set_eval_mode()
-            valid_loss, score = self._validation_epoch(epoch)
+        # valid_loss, score = self._validation_epoch(epoch)  # Validation disabled
             
             if self.config['scheduler']['update_interval'] == 'epoch':
                 if self.config['scheduler']['use_plateau']:
-                    self.scheduler.step(score)
+                    pass
+                    # self.scheduler.step(score)  # Validation disabled
                 else:
                     self.scheduler.step()
 
             if (self.rank == 0) and (epoch % self.save_checkpoint_interval == 0):
-                self._save_checkpoint(epoch, score)
+                pass
+                # self._save_checkpoint(epoch, score)  # Validation disabled
 
         if self.rank == 0:
             torch.save(self.state_dict_best,

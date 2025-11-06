@@ -6,16 +6,16 @@ from torch.utils import data
 import numpy as np
 import random
 
-NOISY_DATABASE_TRAIN = '/data/ssd0/xiaobin.rong/Datasets/DNS3/train_noisy'
-NOISY_DATABASE_VALID = '/data/ssd0/xiaobin.rong/Datasets/DNS3/dev_noisy'
+NOISY_DATABASE_TRAIN = '/home/wangzq_lab/cse12211026/SEtrain/Dataset/origin/train_noisy'
+NOISY_DATABASE_VALID = '/home/wangzq_lab/cse12211026/SEtrain/Dataset/origin/train_noisy'
 
 class DNS3Dataset(torch.utils.data.Dataset):
     def __init__(
         self,
         fs=16000,
-        length_in_seconds=8,
-        num_data_tot=720000,
-        num_data_per_epoch=40000,
+        length_in_seconds=1,
+        num_data_tot=2,
+        num_data_per_epoch=1,
         random_start_point=False,
         train=True
     ):
@@ -33,7 +33,14 @@ class DNS3Dataset(torch.utils.data.Dataset):
         self.train = train
         
     def sample_data_per_epoch(self):
-        self.noisy_data_train = random.sample(self.noisy_database_train, self.num_data_per_epoch)
+        print(f"self.num_data_per_epoch: {self.num_data_per_epoch}")
+        print(f"self.noisy_database_train: {self.noisy_database_train}")
+        if self.num_data_per_epoch > len(self.noisy_database_train):
+            print(f"[Warning] num_data_per_epoch ({self.num_data_per_epoch}) > available data ({len(self.noisy_database_train)}), using random.choices (with replacement).")
+            self.noisy_data_train = random.choices(self.noisy_database_train, k=self.num_data_per_epoch)
+        else:
+            self.noisy_data_train = random.sample(self.noisy_database_train, self.num_data_per_epoch)
+        print(f"self.noisy_data_train:{len(self.noisy_data_train)}")
 
     def __getitem__(self, idx):
         if self.train:
@@ -43,13 +50,19 @@ class DNS3Dataset(torch.utils.data.Dataset):
 
         if self.random_start_point:
             Begin_S = int(np.random.uniform(0, 10 - self.length_in_seconds)) * self.fs
+            # Begin_S = 0
             noisy, _ = sf.read(noisy_list[idx], dtype='float32',start= Begin_S,stop = Begin_S + self.L)
             clean, _ = sf.read(noisy_list[idx].replace('noisy', 'clean'), dtype='float32',start=Begin_S, stop=Begin_S + self.L)
 
         else:
             noisy, _ = sf.read(noisy_list[idx], dtype='float32',start= 0, stop = self.L) 
             clean, _ = sf.read(noisy_list[idx].replace('noisy', 'clean'), dtype='float32', start=0, stop=self.L)
-
+        ### only for debug
+        print(len(noisy_list))
+        print("shape:")
+        print(noisy.shape)
+        print(clean.shape)
+        ###
         return noisy, clean
 
     def __len__(self):
