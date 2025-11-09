@@ -353,7 +353,7 @@ if __name__ == "__main__":
     """complexity count"""
     from ptflops import get_model_complexity_info
     flops, params = get_model_complexity_info(model, (16000,), as_strings=True,
-                                            print_per_layer_stat=True, verbose=True, backend="aten")
+                                            print_per_layer_stat=True, verbose=False, backend="aten")
     params = 0
     for p in model.parameters():
         params += p.numel()

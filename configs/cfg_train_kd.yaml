@@ -62,9 +62,9 @@ trainer:
   epochs: 200
   save_checkpoint_interval: 1
   clip_grad_norm_value: 3.0
-  teacher_checkpoint: D:/windy/speech-enhancement/SEtrain/exp_gtcrn_2025-09-10-23h28m/checkpoints/model_235.tar
+  teacher_checkpoint: /home/nis/zhiheng.wang/SEtrain/experiments/exp_gtcrn_2025-09-10-23h28m/checkpoints/model_235.tar
   kd_weight: 1
-  exp_path: D:/windy/speech-enhancement/SEtrain/exp_gtcrn
+  exp_path: /home/nis/zhiheng.wang/SEtrain/experiments/exp_gtcrn
   resume: True
   reset_optimizer: False
   resume_datetime: 2025-09-18-17h32m

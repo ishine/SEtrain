@@ -2,18 +2,37 @@
 GTCRN: ShuffleNetV2 + SFE + TRA + 2 DPGRNN
 Ultra tiny, 33.0 MMACs, 23.67 K params -> 93.28 MMac 89.429 K params ?
 """
-import math
 import torch
 import numpy as np
 import torch.nn as nn
 from einops import rearrange
 import torch.nn.functional as F
 from torch.profiler import record_function
-from gtcrn_dynamic_dprnn_fattn_rnn import MultiheadSelfAttention
 
 calculate_macs_mode = False
-
 CHANNELS = 16
+
+
+class PD(nn.Module):
+    def __init__(self, n_fft, hop_length):
+        super().__init__()
+        dt_offset = - 2 * np.pi * hop_length / n_fft * torch.arange(0, n_fft//2 + 1).reshape(1, 1, -1)  # (1,1,F)
+        self.register_buffer('dt_offset', dt_offset)
+        dt_kernel = torch.tensor([-1, 1]).reshape(1, 1, 2, 1).float()
+        df_kernel = torch.tensor([-1, 1]).reshape(1, 1, 1, 2).float()
+        self.register_buffer('dt_kernel', dt_kernel)
+        self.register_buffer('df_kernel', df_kernel)
+
+    def forward(self, x):
+        """x: (B, T, F)"""
+        x = x.unsqueeze(1)  # (B,1,T,F)
+        xt = F.pad(x, pad=(0, 0, 1, 0), mode='replicate')  # (B,1,T+1,F)
+        xf = F.pad(x, pad=(1, 0, 0, 0), mode='replicate')  # (B,1,T,F+1)
+        dt = F.conv2d(xt, self.dt_kernel).squeeze(1)  # (B,T,F)
+        df = F.conv2d(xf, self.df_kernel).squeeze(1)  # (B,T,F)
+        dt += self.dt_offset
+        return dt, df
+
 
 class ERB(nn.Module):
     def __init__(self, erb_subband_1, erb_subband_2, nfft=512, high_lim=8000, fs=16000):
@@ -157,6 +176,21 @@ class Conv2dAttention(nn.Module):
         out = F.conv2d(unfolded2, grouped_kernels, bias=grouped_bias, stride=self.stride, padding=(0, self.padding[1]), groups=x.shape[0]*x.shape[2]*self.groups)
         out = rearrange(out, "1 (b t o) 1 f -> b o t f", b=x.shape[0], t=x.shape[2], o=self.out_channels)
         return out
+     
+    def deconv(self, x, attention):
+        x_pad = F.pad(x, [0, 0, self.pad_left, 0])  # pad left for causality
+        unfolded = F.unfold(x_pad, (self.kernel_size[0] * self.dilation[0] - self.dilation[0] + 1, 1), dilation=(1, 1), padding=(0, 0), stride=(self.stride[0], 1))
+        unfolded2 = rearrange(unfolded, "b (c p) (t f) -> 1 (b t c) p f", c=x.shape[1], p=self.kernel_size[0] * self.dilation[0] - self.dilation[0] + 1, t=x.shape[2], f=x.shape[3])
+        # x: (B, C, T, F)
+        # unfolded: (B, C * K_T, T * F) -> (1, B*T*C, K_T, F)
+        # attention: (B, K, T)
+        grouped_kernels = torch.einsum("kiopq, bkt -> btiopq", self.candidates, attention)
+        grouped_kernels = rearrange(grouped_kernels, "b t i o p q -> (b t o) i p q")
+        grouped_bias = torch.einsum("ko, bkt -> bto", self.candidates_bias, attention)
+        grouped_bias = rearrange(grouped_bias, "b t o -> (b t o)")
+        out = F.conv_transpose2d(unfolded2, grouped_kernels, bias=grouped_bias, stride=self.stride, padding=self.padding, groups=x.shape[0]*x.shape[2]*self.groups, dilation=self.dilation)
+        out = rearrange(out, "1 (b t o) 1 f -> b o t f", b=x.shape[0], t=x.shape[2], o=self.out_channels)
+        return out
     
     def conv_and_sum(self, x, attention):
         x_pad = F.pad(x, [0, 0, self.pad_left, 0])  # pad left for causality
@@ -166,19 +200,6 @@ class Conv2dAttention(nn.Module):
         out = rearrange(out, "b (o k) t f -> b o k t f", o=self.out_channels, k=self.candidates_bias.shape[0])
         out = torch.einsum("b o k t f, b k t -> b o t f", out, attention)
         return out
-
-    def deconv(self, out, attention):
-        out = F.pad(out, [0, 0, self.pad_left, 0])  # pad left for causality
-        attention = F.pad(attention, [self.pad_left, 0], "replicate")  # pad left for causality
-        grouped_kernels = torch.einsum("kiopq, bkt -> btiopq", self.candidates, attention)
-        grouped_kernels = rearrange(grouped_kernels, "b t i o p q -> (b t o) i p q")
-        grouped_bias = torch.einsum("ko, bkt -> bto", self.candidates_bias, attention)
-        grouped_bias = rearrange(grouped_bias, "b t o -> (b t o)")
-        out1 = rearrange(out, "b o t f -> 1 (b t o) 1 f")
-        unfolded2 = F.conv_transpose2d(out1, grouped_kernels, bias=grouped_bias, stride=self.stride, padding=(0, self.padding[1]), groups=out.shape[0]*out.shape[2]*self.groups)
-        unfolded = rearrange(unfolded2, "1 (b t c) p f -> b (c p) (t f)", b=out.shape[0], t=out.shape[2], c=self.out_channels)
-        x = F.fold(unfolded, (out.shape[2] - self.pad_left, out.shape[3]), (self.kernel_size[0], 1), dilation=(self.dilation[0], 1), padding=(self.padding[0], 0), stride=(self.stride[0], 1))
-        return x
     
     def deconv_and_sum(self, out, attention):
         out = F.pad(out, [0, 0, self.pad_left, 0])  # pad left for causality
@@ -285,22 +306,6 @@ class GRNN(nn.Module):
         h = torch.cat([h1, h2], dim=-1)
         return y, h
     
-class PositionalEncoding(nn.Module):
-    def __init__(self, d_model: int, dropout: float = 0, max_len: int = 500):
-        super().__init__()
-        self.dropout = nn.Dropout(p=dropout)
-
-        # 创建一个足够大的PE矩阵，以便容纳最长序列
-        position = torch.arange(max_len).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
-        pe = torch.zeros(1, max_len, d_model)
-        pe[0, :, 0::2] = torch.sin(position * div_term)
-        pe[0, :, 1::2] = torch.cos(position * div_term)
-        self.register_buffer('pe', pe)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.pe[:, :x.size(1), :]
-        return self.dropout(x)
     
 class DPGRNN(nn.Module):
     """Grouped Dual-path RNN"""
@@ -310,14 +315,9 @@ class DPGRNN(nn.Module):
         self.width = width
         self.hidden_size = hidden_size
 
-        self.pos_enc = PositionalEncoding(d_model=input_size, dropout=0, max_len=500)
-        self.intra_attn = MultiheadSelfAttention(embed_dim=input_size, num_heads=4, hidden_dim=input_size)
+        self.intra_rnn = GRNN(input_size=input_size, hidden_size=hidden_size//2, bidirectional=True)
         self.intra_fc = nn.Linear(hidden_size, hidden_size)
-        self.intra_pre_ln = nn.LayerNorm(hidden_size, eps=1e-8)
-        self.intra_post_ln = nn.LayerNorm((width, hidden_size), eps=1e-8)
-        self.intra_fc1 = nn.Linear(hidden_size, hidden_size)
-        self.intra_act = nn.PReLU()
-        self.intra_fc2 = nn.Linear(hidden_size, hidden_size)
+        self.intra_ln = nn.LayerNorm((width, hidden_size), eps=1e-8)
 
         self.inter_rnn = GRNN(input_size=input_size, hidden_size=hidden_size, bidirectional=False)
         self.inter_fc = nn.Linear(hidden_size, hidden_size)
@@ -325,21 +325,14 @@ class DPGRNN(nn.Module):
     
     def forward(self, x):
         """x: (B, C, T, F)"""
-        ## Intra Self-Attention
+        ## Intra RNN
         x = x.permute(0, 2, 3, 1)  # (B,T,F,C)
-        residue = x
-        x = self.intra_pre_ln(x)
         intra_x = x.reshape(x.shape[0] * x.shape[1], x.shape[2], x.shape[3])  # (B*T,F,C)
-        intra_x = self.pos_enc(intra_x)
-        intra_x = self.intra_attn(intra_x, need_weights=False)[0]  # (B*T,F,C)
+        intra_x = self.intra_rnn(intra_x)[0]  # (B*T,F,C)
+        intra_x = self.intra_fc(intra_x)      # (B*T,F,C)
         intra_x = intra_x.reshape(x.shape[0], -1, self.width, self.hidden_size) # (B,T,F,C)
-        intra_x = self.intra_pre_ln(intra_x) + residue
-        residue = intra_x
-        intra_x = self.intra_fc1(intra_x)
-        intra_x = self.intra_act(intra_x)
-        intra_x = self.intra_fc2(intra_x)
-        intra_x = self.intra_post_ln(intra_x)
-        intra_out = torch.add(intra_x, residue)
+        intra_x = self.intra_ln(intra_x)
+        intra_out = torch.add(x, intra_x)
 
         ## Inter RNN
         x = intra_out.permute(0,2,1,3)  # (B,F,T,C)
@@ -416,7 +409,8 @@ class GTCRN(nn.Module):
         self.n_fft = n_fft
         self.hop_len = hop_len
         self.win_len = win_len
-        
+
+        self.pd = PD(n_fft, hop_len)
         self.erb = ERB(65, 64)
         self.sfe = SFE(3, 1)
 
@@ -439,13 +433,14 @@ class GTCRN(nn.Module):
         stft_kwargs = {'n_fft': self.n_fft, 'hop_length': self.hop_len, 'win_length': self.win_len,
                        'window': torch.hann_window(self.win_len).to(device), 'onesided': True}
         
-        spec = torch.stft(x,  **stft_kwargs, return_complex=True)
-        spec = torch.view_as_real(spec)
+        spec_original = torch.stft(x,  **stft_kwargs, return_complex=True)
+        spec = torch.view_as_real(spec_original)
 
         spec_real = spec[..., 0].permute(0,2,1)
         spec_imag = spec[..., 1].permute(0,2,1)
         spec_mag = torch.sqrt(spec_real**2 + spec_imag**2 + 1e-12)
-        feat = torch.stack([spec_mag, spec_real, spec_imag], dim=1)  # (B,3,T,257)
+        dt, df = self.pd(torch.angle(spec_original).permute(0,2,1))  # (B,T,F)
+        feat = torch.stack([spec_mag, dt, df], dim=1)  # (B,3,T,257)
         
         spec = spec.permute(0,3,2,1)  # (B,2,T,F)
 

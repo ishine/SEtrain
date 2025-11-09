@@ -1,5 +1,5 @@
-import gtcrn_dynamic_per_band_acrean as module
-from gtcrn_dynamic_per_band_acrean import GTCRN
+import gtcrn_dynamic_dprnn_fattn as module
+from gtcrn_dynamic_dprnn_fattn import GTCRN
 import torch
 import time
 from math import sqrt

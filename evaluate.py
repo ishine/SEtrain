@@ -9,7 +9,7 @@ def main(args):
     
     if args.metric == 'dnsmos':
         os.system(
-            ('evaluation\\venv\\Scripts\\python.exe ./evaluation/calculate_nonintrusive_dnsmos.py '
+            ('./evaluation/venv/bin/python ./evaluation/calculate_nonintrusive_dnsmos.py '
                 f'--inf_scp {enh_folder}/inf.scp '
                 f'--output_dir {enh_folder}/scoring_dnsmos '
                 f'--device {args.dnsmos_device} '
@@ -21,7 +21,7 @@ def main(args):
         )    
     elif args.metric == 'intrusive':
         os.system(
-            ('evaluation\\venv\\Scripts\\python.exe ./evaluation/calculate_intrusive_se_metrics.py '
+            ('./evaluation/venv/bin/python ./evaluation/calculate_intrusive_se_metrics.py '
              f'--ref_scp {enh_folder}/ref.scp '
              f'--inf_scp {enh_folder}/inf.scp '
              f'--output_dir {enh_folder}/scoring_intrusive '
