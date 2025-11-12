@@ -14,9 +14,6 @@ def parse_table(md_path):
         if not line.strip():
             continue
         
-        # Handle bolded model names
-        is_baseline = '**' in line
-        
         # Clean the line for parsing
         cleaned_line = line.replace('**', '').strip().strip('|')
         values = [v.strip() for v in cleaned_line.split('|')]
@@ -30,7 +27,7 @@ def parse_table(md_path):
             # Fallback if no number is at the start
             model_index = len(data) + 1
 
-        row_data = {'index': model_index, 'is_baseline': is_baseline}
+        row_data = {'index': model_index}
         
         for i, col_name in enumerate(header):
             # The first column is 'Model', which we've handled
@@ -38,7 +35,14 @@ def parse_table(md_path):
                 row_data[col_name] = model_name
                 continue
 
-            value_str = values[i]
+            try:
+                value_str = values[i]
+            except IndexError:
+                value_str = '' # Handle rows with missing columns
+
+            if col_name == 'Plot':
+                row_data[col_name] = value_str
+                continue
             
             # Handle special cases like '0.036+-0.005647' for time and '(34.73)' for computation
             if '+-' in value_str:
@@ -59,16 +63,25 @@ def plot_data(df, x_col, y_col, title, x_label, y_label, output_path):
     plt.style.use('dark_background')
     fig, ax = plt.subplots(figsize=(10, 8))
 
-    # Separate baseline and other models
-    baseline_df = df[df['is_baseline'] == True]
-    other_df = df[df['is_baseline'] == False]
+    # Filter out rows where 'Plot' is empty
+    plot_df = df[df['Plot'].notna() & (df['Plot'] != '')].copy()
+
+    # Define a color mapping if you want to map short codes to color names
+    color_map = {
+        'r': 'red',
+        'g': 'green',
+        'b': 'blue',
+        'y': 'yellow',
+        'c': 'cyan',
+        'm': 'magenta'
+    }
+    plot_df['color'] = plot_df['Plot'].map(color_map).fillna('white')
 
     # Plot points
-    ax.scatter(baseline_df[x_col], baseline_df[y_col], c='red', s=100, zorder=5)
-    ax.scatter(other_df[x_col], other_df[y_col], c='blue', s=100, zorder=5)
+    ax.scatter(plot_df[x_col], plot_df[y_col], c=plot_df['color'], s=100, zorder=5)
 
     # Annotate points with their index
-    for _, row in df.iterrows():
+    for _, row in plot_df.iterrows():
         if pd.notna(row[x_col]) and pd.notna(row[y_col]):
             ax.text(row[x_col], row[y_col], str(row['index']), color='white', 
                     ha='center', va='center', fontsize=12, zorder=10)
@@ -108,3 +121,12 @@ if __name__ == "__main__":
               x_label='CPU computation', 
               y_label='PESQ', 
               output_path='figures/pesq_vs_computation.png')
+    
+    # Plot 3: P808_MOS vs CPU computation
+    plot_data(df,
+              x_col='CPU计算量',
+              y_col='P808_MOS',
+              title='P808_MOS vs. CPU computation',
+              x_label='CPU computation',
+              y_label='P808_MOS',
+              output_path='figures/p808_mos_vs_computation.png')
