@@ -1,5 +1,5 @@
-import gtcrn_dynamic_dprnn_fattn as module
-from gtcrn_dynamic_dprnn_fattn import GTCRN
+import gtcrn_dynamic_irm as module
+from gtcrn_dynamic_irm import GTCRN
 import torch
 import time
 from math import sqrt

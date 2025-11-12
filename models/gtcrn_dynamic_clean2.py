@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from torch.profiler import record_function
 
 calculate_macs_mode = False
-CHANNELS = 32
+CHANNELS = 8
 
 
 class ERB(nn.Module):
@@ -332,7 +332,7 @@ class Encoder(nn.Module):
     def __init__(self):
         super().__init__()
         self.en_convs = nn.ModuleList([
-            ConvBlock(1*3, CHANNELS, (1,5), stride=(1,2), padding=(0,2), use_deconv=False, is_last=False),
+            ConvBlock(3*3, CHANNELS, (1,5), stride=(1,2), padding=(0,2), use_deconv=False, is_last=False),
             ConvBlock(CHANNELS, CHANNELS, (1,5), stride=(1,2), padding=(0,2), groups=2, use_deconv=False, is_last=False),
             GTConvBlock(CHANNELS, CHANNELS, (3,3), stride=(1,1), padding=(0,1), dilation=(1,1), use_deconv=False),
             GTConvBlock(CHANNELS, CHANNELS, (3,3), stride=(1,1), padding=(0,1), dilation=(2,1), use_deconv=False),
@@ -355,7 +355,7 @@ class Decoder(nn.Module):
             GTConvBlock(CHANNELS, CHANNELS, (3,3), stride=(1,1), padding=(2*2,1), dilation=(2,1), use_deconv=True),
             GTConvBlock(CHANNELS, CHANNELS, (3,3), stride=(1,1), padding=(1*2,1), dilation=(1,1), use_deconv=True),
             ConvBlock(CHANNELS, CHANNELS, (1,5), stride=(1,2), padding=(0,2), groups=2, use_deconv=True, is_last=False),
-            ConvBlock(CHANNELS, 1, (1,5), stride=(1,2), padding=(0,2), use_deconv=True, is_last=True)
+            ConvBlock(CHANNELS, 2, (1,5), stride=(1,2), padding=(0,2), use_deconv=True, is_last=True)
         ])
 
     def forward(self, x, en_outs):
@@ -366,13 +366,13 @@ class Decoder(nn.Module):
     
 
 class Mask(nn.Module):
-    """Ideal Ratio Mask"""
+    """Complex Ratio Mask"""
     def __init__(self):
         super().__init__()
 
     def forward(self, mask, spec):
-        s_real = spec[:,0] * mask[:,0]
-        s_imag = spec[:,1] * mask[:,0]
+        s_real = spec[:,0] * mask[:,0] - spec[:,1] * mask[:,1]
+        s_imag = spec[:,1] * mask[:,0] + spec[:,0] * mask[:,1]
         s = torch.stack([s_real, s_imag], dim=1)  # (B,2,T,F)
         return s
 
@@ -417,12 +417,12 @@ class GTCRN(nn.Module):
         spec_real = spec[..., 0].permute(0,2,1)
         spec_imag = spec[..., 1].permute(0,2,1)
         spec_mag = torch.sqrt(spec_real**2 + spec_imag**2 + 1e-12)
-        feat = torch.unsqueeze(spec_mag, 1)  # (B,1,T,257)
+        feat = torch.stack([spec_mag, spec_real, spec_imag], dim=1)  # (B,3,T,257)
         
         spec = spec.permute(0,3,2,1)  # (B,2,T,F)
 
-        feat = self.erb.bm(feat)  # (B,1,T,129)
-        feat = self.sfe(feat)     # (B,3,T,129)
+        feat = self.erb.bm(feat)  # (B,3,T,129)
+        feat = self.sfe(feat)     # (B,9,T,129)
 
         feat, en_outs = self.encoder(feat)
         

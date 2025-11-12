@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from torch.profiler import record_function
 
 calculate_macs_mode = False
-CHANNELS = 32
+CHANNELS = 16
 
 
 class ERB(nn.Module):
@@ -366,23 +366,48 @@ class Decoder(nn.Module):
     
 
 class Mask(nn.Module):
-    """Ideal Ratio Mask"""
-    def __init__(self):
+    """Ideal Ratio Mask with Griffin-Lim phase reconstruction"""
+    def __init__(self, n_fft, hop_len, win_len, gl_iter=3):
         super().__init__()
+        self.n_fft = n_fft
+        self.hop_len = hop_len
+        self.win_len = win_len
+        self.gl_iter = gl_iter
 
-    def forward(self, mask, spec):
-        s_real = spec[:,0] * mask[:,0]
-        s_imag = spec[:,1] * mask[:,0]
-        s = torch.stack([s_real, s_imag], dim=1)  # (B,2,T,F)
+    def forward(self, mask, spec, noisy_phase):
+        """
+        mask: (B, 1, T, F)
+        spec: (B, 2, T, F)
+        noisy_phase: (B, T, F)
+        """
+        spec_mag = torch.sqrt(spec[:,0]**2 + spec[:,1]**2 + 1e-12) # (B, T, F)
+        enh_mag = spec_mag * mask[:,0] # (B, T, F)
+
+        # Griffin-Lim
+        phase = noisy_phase.permute(0,2,1) # (B, F, T)
+        
+        stft_kwargs = {'n_fft': self.n_fft, 'hop_length': self.hop_len, 'win_length': self.win_len,
+                       'window': torch.hann_window(self.win_len, device=spec.device), 'onesided': True}
+
+        for _ in range(self.gl_iter):
+            enh_spec_complex = torch.complex(enh_mag.permute(0,2,1) * torch.cos(phase), enh_mag.permute(0,2,1) * torch.sin(phase))
+            y = torch.istft(enh_spec_complex, **stft_kwargs, return_complex=False)
+            new_spec = torch.stft(y, **stft_kwargs, return_complex=True)
+            phase = torch.angle(new_spec)
+
+        enh_spec_complex = torch.complex(enh_mag.permute(0,2,1) * torch.cos(phase), enh_mag.permute(0,2,1) * torch.sin(phase))
+        
+        # to (B,2,T,F)
+        s = torch.view_as_real(enh_spec_complex.permute(0,2,1)).permute(0,3,1,2)
         return s
-
 
 class GTCRN(nn.Module):
     def __init__(
         self,
         n_fft=512,
         hop_len=256,
-        win_len=512
+        win_len=512,
+        gl_iter=10
     ):
         super().__init__()
         self.n_fft = n_fft
@@ -399,7 +424,7 @@ class GTCRN(nn.Module):
         
         self.decoder = Decoder()
 
-        self.mask = Mask()
+        self.mask = Mask(n_fft, hop_len, win_len, gl_iter)
 
     def forward(self, x):
         """
@@ -417,6 +442,7 @@ class GTCRN(nn.Module):
         spec_real = spec[..., 0].permute(0,2,1)
         spec_imag = spec[..., 1].permute(0,2,1)
         spec_mag = torch.sqrt(spec_real**2 + spec_imag**2 + 1e-12)
+        noisy_phase = torch.atan2(spec_imag, spec_real)  # (B,T,F)
         feat = torch.unsqueeze(spec_mag, 1)  # (B,1,T,257)
         
         spec = spec.permute(0,3,2,1)  # (B,2,T,F)
@@ -433,7 +459,7 @@ class GTCRN(nn.Module):
         
         m = self.erb.bs(m_feat)
 
-        spec_enh = self.mask(m, spec) # (B,2,T,F)
+        spec_enh = self.mask(m, spec, noisy_phase) # (B,2,T,F)
         spec_enh = spec_enh.permute(0,3,2,1)  # (B,F,T,2)
         
         spec_enh = torch.complex(spec_enh[...,0], spec_enh[...,1])

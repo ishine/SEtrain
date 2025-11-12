@@ -61,7 +61,7 @@ def parse_table(md_path):
 
 def plot_data(df, x_col, y_col, title, x_label, y_label, output_path):
     plt.style.use('dark_background')
-    fig, ax = plt.subplots(figsize=(10, 8))
+    fig, ax = plt.subplots(figsize=(12, 8))
 
     # Filter out rows where 'Plot' is empty
     plot_df = df[df['Plot'].notna() & (df['Plot'] != '')].copy()
@@ -75,21 +75,41 @@ def plot_data(df, x_col, y_col, title, x_label, y_label, output_path):
         'c': 'cyan',
         'm': 'magenta'
     }
+    
+    plot_df['color_code'] = plot_df['Plot']
     plot_df['color'] = plot_df['Plot'].map(color_map).fillna('white')
 
-    # Plot points
-    ax.scatter(plot_df[x_col], plot_df[y_col], c=plot_df['color'], s=100, zorder=5)
+    # Create legend
+    legend_labels = {}
+    # Use a temporary df to ensure we get the first model name based on original order
+    temp_df = df.dropna(subset=['Plot']).sort_index()
+    for _, row in temp_df.iterrows():
+        color_code = row['Plot']
+        if color_code not in legend_labels:
+            model_name = row['Model']
+            # Clean up model name for legend: remove markdown bold, numbers, and Chinese parentheses
+            cleaned_model_name = re.sub(r'\*\*(\d+\.\s*)?|\*\*|（[^）]*）', '', model_name).strip()
+            legend_labels[color_code] = cleaned_model_name
+
+    # Plot points for each color group to create legend entries
+    for color_code, label in legend_labels.items():
+        color_name = color_map.get(color_code, 'white')
+        subset = plot_df[plot_df['color_code'] == color_code]
+        ax.scatter(subset[x_col], subset[y_col], c=color_name, s=100, zorder=5, label=label)
 
     # Annotate points with their index
     for _, row in plot_df.iterrows():
         if pd.notna(row[x_col]) and pd.notna(row[y_col]):
             ax.text(row[x_col], row[y_col], str(row['index']), color='white', 
-                    ha='center', va='center', fontsize=12, zorder=10)
+                    ha='center', va='center', fontsize=9, zorder=10)
 
     ax.set_xlabel(x_label, fontsize=16)
     ax.set_ylabel(y_label, fontsize=16)
     ax.set_title(title, fontsize=20)
     ax.grid(True, which='both', linestyle='--', linewidth=0.5, color='gray')
+    
+    # Add legend
+    ax.legend(title="Model Types", fontsize=10)
     
     plt.tight_layout()
     plt.savefig(output_path)

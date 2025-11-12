@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from torch.profiler import record_function
 
 calculate_macs_mode = False
-CHANNELS = 20
+CHANNELS = 32
 
 
 class ERB(nn.Module):

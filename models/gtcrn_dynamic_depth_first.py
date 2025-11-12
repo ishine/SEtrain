@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from torch.profiler import record_function
 
 calculate_macs_mode = False
-CHANNELS = 32
+CHANNELS = 16
 
 
 class ERB(nn.Module):
@@ -86,7 +86,7 @@ class TRA(nn.Module):
         self.kernels = kernels
         self.kat_heads = kat_heads
         self.att_gru = nn.GRU(channels, channels*2, 1, batch_first=True)
-        self.att_fc1 = nn.Linear(channels*2, channels)
+        self.att_fc1 = nn.Linear(channels*2, channels*2)
         self.att_act1 = nn.Sigmoid()
         self.att_fc2 = nn.Linear(channels * 2, kat_heads * kernels)
         self.att_act2 = nn.Softmax(dim=2)
@@ -95,15 +95,16 @@ class TRA(nn.Module):
         """x: (B,C,T,F)"""
         zt = torch.mean(x.pow(2), dim=-1)  # (B,C,T)
         at = self.att_gru(zt.transpose(1,2))[0]
-        at1 = self.att_fc1(at).transpose(1,2)
+        at1 = self.att_fc1(at).transpose(1,2)  # (B,2C,T)
         at1 = self.att_act1(at1)
-        At = at1[..., None]  # (B,C,T,1)
+        At = at1[..., None]  # (B,2C,T,1)
+        Ats = At.chunk(2, dim=1)  # 2 * (B,C,T,1)
         kat = self.att_fc2(at).transpose(1,2) # (B,kat_heads*kernels,T)
         kat = kat.reshape(x.shape[0], self.kat_heads, self.kernels, x.shape[2])  # (B,kat_heads,kernels,T)
         kat = self.att_act2(kat)
         kat = torch.unbind(kat, dim=1)  # kat_heads * (B,kernels,T)
 
-        return At, kat
+        return Ats, kat
 
 
 class ConvBlock(nn.Module):
@@ -211,20 +212,20 @@ class GTConvBlock(nn.Module):
         self.sfe = SFE(kernel_size=3, stride=1)
 
         self.ln = nn.LayerNorm((in_channels//2*3, 33))
+
+        self.depth_conv = Conv2dAttention(in_channels//2*3, in_channels//2*3, kernel_size,
+                                            stride=stride, padding=padding,
+                                            dilation=dilation, groups=in_channels//2*3, use_deconv=use_deconv, pad_left=self.pad_size, 
+                                            kernel_choices=kernel_choices)
+        self.depth_bn = nn.BatchNorm2d(in_channels//2*3)
+        self.depth_act = nn.PReLU()
         
         self.point_conv1 = Conv2dAttention(in_channels//2*3, hidden_channels, (1, 1), use_deconv=use_deconv, kernel_choices=kernel_choices)
-        self.point_bn1 = nn.BatchNorm2d(hidden_channels)
-        self.point_act = nn.PReLU()
-
-        self.depth_conv = Conv2dAttention(hidden_channels, hidden_channels, kernel_size,
-                                            stride=stride, padding=padding,
-                                            dilation=dilation, groups=hidden_channels, use_deconv=use_deconv, pad_left=self.pad_size, 
-                                            kernel_choices=kernel_choices)
-        self.depth_bn = nn.BatchNorm2d(hidden_channels)
-        self.depth_act = nn.PReLU()
+        self.point_act1 = nn.GELU()
 
         self.point_conv2 = Conv2dAttention(hidden_channels, in_channels//2, (1, 1), use_deconv=use_deconv, kernel_choices=kernel_choices)
-        self.point_bn2 = nn.BatchNorm2d(in_channels//2)
+        self.point_bn = nn.BatchNorm2d(in_channels//2)
+        self.point_act2 = nn.PReLU()
         
         self.tra = TRA(in_channels//2, kernel_choices, 3)
 
@@ -239,17 +240,18 @@ class GTConvBlock(nn.Module):
         """x: (B, C, T, F)"""
         x1, x2 = torch.chunk(x, chunks=2, dim=1)
 
-        mask, (kat1, kat2, kat3) = self.tra(x1)
+        (mask1, mask2), (kat1, kat2, kat3) = self.tra(x1)
+        x1 = x1 * mask1
         x1 = self.sfe(x1)
         x1 = x1.permute(0,2,1,3)  # (B,T,C,F)
         x1 = self.ln(x1)
         x1 = x1.permute(0,2,1,3)  # (B,C,T,F)
-        h1 = self.point_act(self.point_bn1(self.point_conv1(x1, kat1)))
         # h1 = nn.functional.pad(h1, [0, 0, self.pad_size, 0])
-        h1 = self.depth_act(self.depth_bn(self.depth_conv(h1, kat2)))
-        h1 = self.point_bn2(self.point_conv2(h1, kat3))
+        h1 = self.depth_act(self.depth_bn(self.depth_conv(x1, kat2)))
+        h1 = self.point_act1((self.point_conv1(h1, kat1)))
+        h1 = self.point_act2(self.point_bn(self.point_conv2(h1, kat3)))
 
-        h1 = h1 * mask
+        h1 = h1 * mask2
 
         x =  self.shuffle(h1, x2)
         
@@ -332,7 +334,7 @@ class Encoder(nn.Module):
     def __init__(self):
         super().__init__()
         self.en_convs = nn.ModuleList([
-            ConvBlock(1*3, CHANNELS, (1,5), stride=(1,2), padding=(0,2), use_deconv=False, is_last=False),
+            ConvBlock(3*3, CHANNELS, (1,5), stride=(1,2), padding=(0,2), use_deconv=False, is_last=False),
             ConvBlock(CHANNELS, CHANNELS, (1,5), stride=(1,2), padding=(0,2), groups=2, use_deconv=False, is_last=False),
             GTConvBlock(CHANNELS, CHANNELS, (3,3), stride=(1,1), padding=(0,1), dilation=(1,1), use_deconv=False),
             GTConvBlock(CHANNELS, CHANNELS, (3,3), stride=(1,1), padding=(0,1), dilation=(2,1), use_deconv=False),
@@ -355,7 +357,7 @@ class Decoder(nn.Module):
             GTConvBlock(CHANNELS, CHANNELS, (3,3), stride=(1,1), padding=(2*2,1), dilation=(2,1), use_deconv=True),
             GTConvBlock(CHANNELS, CHANNELS, (3,3), stride=(1,1), padding=(1*2,1), dilation=(1,1), use_deconv=True),
             ConvBlock(CHANNELS, CHANNELS, (1,5), stride=(1,2), padding=(0,2), groups=2, use_deconv=True, is_last=False),
-            ConvBlock(CHANNELS, 1, (1,5), stride=(1,2), padding=(0,2), use_deconv=True, is_last=True)
+            ConvBlock(CHANNELS, 2, (1,5), stride=(1,2), padding=(0,2), use_deconv=True, is_last=True)
         ])
 
     def forward(self, x, en_outs):
@@ -366,13 +368,13 @@ class Decoder(nn.Module):
     
 
 class Mask(nn.Module):
-    """Ideal Ratio Mask"""
+    """Complex Ratio Mask"""
     def __init__(self):
         super().__init__()
 
     def forward(self, mask, spec):
-        s_real = spec[:,0] * mask[:,0]
-        s_imag = spec[:,1] * mask[:,0]
+        s_real = spec[:,0] * mask[:,0] - spec[:,1] * mask[:,1]
+        s_imag = spec[:,1] * mask[:,0] + spec[:,0] * mask[:,1]
         s = torch.stack([s_real, s_imag], dim=1)  # (B,2,T,F)
         return s
 
@@ -417,12 +419,12 @@ class GTCRN(nn.Module):
         spec_real = spec[..., 0].permute(0,2,1)
         spec_imag = spec[..., 1].permute(0,2,1)
         spec_mag = torch.sqrt(spec_real**2 + spec_imag**2 + 1e-12)
-        feat = torch.unsqueeze(spec_mag, 1)  # (B,1,T,257)
+        feat = torch.stack([spec_mag, spec_real, spec_imag], dim=1)  # (B,3,T,257)
         
         spec = spec.permute(0,3,2,1)  # (B,2,T,F)
 
-        feat = self.erb.bm(feat)  # (B,1,T,129)
-        feat = self.sfe(feat)     # (B,3,T,129)
+        feat = self.erb.bm(feat)  # (B,3,T,129)
+        feat = self.sfe(feat)     # (B,9,T,129)
 
         feat, en_outs = self.encoder(feat)
         
