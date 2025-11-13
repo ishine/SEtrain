@@ -155,6 +155,21 @@ class Conv2dAttention(nn.Module):
         out = F.conv2d(unfolded2, grouped_kernels, bias=grouped_bias, stride=self.stride, padding=(0, self.padding[1]), groups=x.shape[0]*x.shape[2]*self.groups)
         out = rearrange(out, "1 (b t o) 1 f -> b o t f", b=x.shape[0], t=x.shape[2], o=self.out_channels)
         return out
+     
+    def deconv(self, x, attention):
+        x_pad = F.pad(x, [0, 0, self.pad_left, 0])  # pad left for causality
+        unfolded = F.unfold(x_pad, (self.kernel_size[0] * self.dilation[0] - self.dilation[0] + 1, 1), dilation=(1, 1), padding=(0, 0), stride=(self.stride[0], 1))
+        unfolded2 = rearrange(unfolded, "b (c p) (t f) -> 1 (b t c) p f", c=x.shape[1], p=self.kernel_size[0] * self.dilation[0] - self.dilation[0] + 1, t=x.shape[2], f=x.shape[3])
+        # x: (B, C, T, F)
+        # unfolded: (B, C * K_T, T * F) -> (1, B*T*C, K_T, F)
+        # attention: (B, K, T)
+        grouped_kernels = torch.einsum("kiopq, bkt -> btiopq", self.candidates, attention)
+        grouped_kernels = rearrange(grouped_kernels, "b t i o p q -> (b t o) i p q")
+        grouped_bias = torch.einsum("ko, bkt -> bto", self.candidates_bias, attention)
+        grouped_bias = rearrange(grouped_bias, "b t o -> (b t o)")
+        out = F.conv_transpose2d(unfolded2, grouped_kernels, bias=grouped_bias, stride=self.stride, padding=self.padding, groups=x.shape[0]*x.shape[2]*self.groups, dilation=self.dilation)
+        out = rearrange(out, "1 (b t o) 1 f -> b o t f", b=x.shape[0], t=x.shape[2], o=self.out_channels)
+        return out
     
     def conv_and_sum(self, x, attention):
         x_pad = F.pad(x, [0, 0, self.pad_left, 0])  # pad left for causality
@@ -164,19 +179,6 @@ class Conv2dAttention(nn.Module):
         out = rearrange(out, "b (o k) t f -> b o k t f", o=self.out_channels, k=self.candidates_bias.shape[0])
         out = torch.einsum("b o k t f, b k t -> b o t f", out, attention)
         return out
-
-    def deconv(self, out, attention):
-        out = F.pad(out, [0, 0, self.pad_left, 0])  # pad left for causality
-        attention = F.pad(attention, [self.pad_left, 0], "replicate")  # pad left for causality
-        grouped_kernels = torch.einsum("kiopq, bkt -> btiopq", self.candidates, attention)
-        grouped_kernels = rearrange(grouped_kernels, "b t i o p q -> (b t o) i p q")
-        grouped_bias = torch.einsum("ko, bkt -> bto", self.candidates_bias, attention)
-        grouped_bias = rearrange(grouped_bias, "b t o -> (b t o)")
-        out1 = rearrange(out, "b o t f -> 1 (b t o) 1 f")
-        unfolded2 = F.conv_transpose2d(out1, grouped_kernels, bias=grouped_bias, stride=self.stride, padding=(0, self.padding[1]), groups=out.shape[0]*out.shape[2]*self.groups)
-        unfolded = rearrange(unfolded2, "1 (b t c) p f -> b (c p) (t f)", b=out.shape[0], t=out.shape[2], c=self.out_channels)
-        x = F.fold(unfolded, (out.shape[2] - self.pad_left, out.shape[3]), (self.kernel_size[0], 1), dilation=(self.dilation[0], 1), padding=(self.padding[0], 0), stride=(self.stride[0], 1))
-        return x
     
     def deconv_and_sum(self, out, attention):
         out = F.pad(out, [0, 0, self.pad_left, 0])  # pad left for causality
