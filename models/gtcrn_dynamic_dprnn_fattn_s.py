@@ -9,11 +9,52 @@ import torch.nn as nn
 from einops import rearrange
 import torch.nn.functional as F
 from torch.profiler import record_function
-from gtcrn_dynamic_dprnn_fattn_rnn import MultiheadSelfAttention
 
 calculate_macs_mode = False
 
 CHANNELS = 32
+DS_GROUP = 2
+GT_DILATIONS = [1,2,5]
+RNN_REPEATS = 8
+
+
+class MultiheadSelfAttention(nn.Module):
+    def __init__(self, embed_dim: int, hidden_dim: int, num_heads: int, dropout: float = 0.0, bias: bool = True):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.hidden_dim = hidden_dim
+        self.num_heads = num_heads
+        self.head_dim = hidden_dim // num_heads
+
+        self.q_proj = nn.Linear(embed_dim, hidden_dim, bias=bias)
+        self.k_proj = nn.Linear(embed_dim, hidden_dim, bias=bias)
+        self.v_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+        self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+        self.attn_drop = nn.Dropout(dropout)
+
+    def forward(self, query: torch.Tensor, need_weights: bool = False):
+        B, N, C = query.shape  # (batch, seq_len, embed)
+        q = self.q_proj(query)
+        k = self.k_proj(query)
+        v = self.v_proj(query)
+
+        # (B, H, N, D)
+        q = q.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+        v = v.view(B, N, self.num_heads, self.embed_dim // self.num_heads).transpose(1, 2)
+
+        attn_scores = torch.matmul(q, k.transpose(-1, -2)) / math.sqrt(self.head_dim)  # (B,H,N,N)
+        attn = torch.softmax(attn_scores, dim=-1)
+        attn = self.attn_drop(attn)
+        out = torch.matmul(attn, v)  # (B,H,N,D)
+
+        out = out.transpose(1, 2).contiguous().view(B, N, C)
+        out = self.out_proj(out)
+        if need_weights:
+            avg_weights = attn.mean(dim=1)  # (B,N,N)
+            return out, avg_weights
+        return out, None
+
 
 class ERB(nn.Module):
     def __init__(self, erb_subband_1, erb_subband_2, nfft=512, high_lim=8000, fs=16000):
@@ -361,13 +402,13 @@ class DPGRNN(nn.Module):
 class Encoder(nn.Module):
     def __init__(self):
         super().__init__()
-        self.en_convs = nn.ModuleList([
+        en_convs = [
             ConvBlock(3*3, CHANNELS, (1,5), stride=(1,2), padding=(0,2), use_deconv=False, is_last=False),
-            ConvBlock(CHANNELS, CHANNELS, (1,5), stride=(1,2), padding=(0,2), groups=2, use_deconv=False, is_last=False),
-            GTConvBlock(CHANNELS, CHANNELS, (3,3), stride=(1,1), padding=(0,1), dilation=(1,1), use_deconv=False),
-            GTConvBlock(CHANNELS, CHANNELS, (3,3), stride=(1,1), padding=(0,1), dilation=(2,1), use_deconv=False),
-            GTConvBlock(CHANNELS, CHANNELS, (3,3), stride=(1,1), padding=(0,1), dilation=(5,1), use_deconv=False)
-        ])
+            ConvBlock(CHANNELS, CHANNELS, (1,5), stride=(1,2), padding=(0,2), groups=DS_GROUP, use_deconv=False, is_last=False)
+        ]
+        for dilation in GT_DILATIONS:
+            en_convs.append(GTConvBlock(CHANNELS, CHANNELS, (3,3), stride=(1,1), padding=(0,1), dilation=(dilation,1), use_deconv=False))
+        self.en_convs = nn.ModuleList(en_convs)
 
     def forward(self, x):
         en_outs = []
@@ -380,13 +421,13 @@ class Encoder(nn.Module):
 class Decoder(nn.Module):
     def __init__(self):
         super().__init__()
-        self.de_convs = nn.ModuleList([
-            GTConvBlock(CHANNELS, CHANNELS, (3,3), stride=(1,1), padding=(5*2,1), dilation=(5,1), use_deconv=True),
-            GTConvBlock(CHANNELS, CHANNELS, (3,3), stride=(1,1), padding=(2*2,1), dilation=(2,1), use_deconv=True),
-            GTConvBlock(CHANNELS, CHANNELS, (3,3), stride=(1,1), padding=(1*2,1), dilation=(1,1), use_deconv=True),
-            ConvBlock(CHANNELS, CHANNELS, (1,5), stride=(1,2), padding=(0,2), groups=2, use_deconv=True, is_last=False),
+        de_convs = [
+            ConvBlock(CHANNELS, CHANNELS, (1,5), stride=(1,2), padding=(0,2), groups=DS_GROUP, use_deconv=True, is_last=False),
             ConvBlock(CHANNELS, 2, (1,5), stride=(1,2), padding=(0,2), use_deconv=True, is_last=True)
-        ])
+        ]
+        for dilation in reversed(GT_DILATIONS):
+            de_convs.insert(0, GTConvBlock(CHANNELS, CHANNELS, (3,3), stride=(1,1), padding=(dilation*2,1), dilation=(dilation,1), use_deconv=True))
+        self.de_convs = nn.ModuleList(de_convs)
 
     def forward(self, x, en_outs):
         N_layers = len(self.de_convs)
@@ -424,8 +465,7 @@ class GTCRN(nn.Module):
 
         self.encoder = Encoder()
         
-        self.dpgrnn1 = DPGRNN(CHANNELS, 33, CHANNELS)
-        self.dpgrnn2 = DPGRNN(CHANNELS, 33, CHANNELS)
+        self.dpgrnns = nn.ModuleList([DPGRNN(CHANNELS, 33, CHANNELS) for _ in range(RNN_REPEATS)])
         
         self.decoder = Decoder()
 
@@ -456,8 +496,8 @@ class GTCRN(nn.Module):
 
         feat, en_outs = self.encoder(feat)
         
-        feat = self.dpgrnn1(feat) # (B,CHANNELS,T,33)
-        feat = self.dpgrnn2(feat) # (B,CHANNELS,T,33)
+        for dpgrnn in self.dpgrnns:
+            feat = dpgrnn(feat) # (B,CHANNELS,T,33)
 
         m_feat = self.decoder(feat, en_outs)
         
