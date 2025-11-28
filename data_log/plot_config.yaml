@@ -14,7 +14,7 @@ color_map:
 legend_labels:
   r: "GTCRN Baseline"
   g: "AdaptConv Baseline"
-  b: "Time Downsample by 4"
-  c: "AdaptConv with IRM"
-  m: "Split-RNN"
-  y: "Split-CNN-GT-RNN"
+  b: "RepConv"
+  c: "Plain Convolution"
+  m: "Attention Mechanism"
+  y: "Concat Skip Connection"

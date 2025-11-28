@@ -158,4 +158,8 @@ very primitive，end2end, 32channel, g16: experiments/exp_gtcrn_2025-11-06-21h55
 
 以后也许可以将codec和dpgrnn分开来搞？codec也许可以使用ConvNeXt中的方式进行一些训练，或者使用非对称解码器，或者pixel shuffle 操作
 
-RepVGG和ConvNeXt都看一下
+RepVGG和ConvNeXt都看一下(前者似乎有效)
+
+考虑不同层动态卷积选择的相关性，进而考虑动态卷积的静态化，或者折中的方案，比如joint attention
+
+再多加一个path，inter-channel可能会有用，说不定是scaling效果不好的原因
