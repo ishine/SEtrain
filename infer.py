@@ -4,7 +4,10 @@ import torch
 import soundfile as sf
 from tqdm import tqdm
 from omegaconf import OmegaConf
-from models.gtcrn_end2end import GTCRN as Model
+import models.gtcrn_dynamic_clean as module
+from models.gtcrn_dynamic_clean import GTCRN as Model
+
+module.calculate_macs_mode = True
 
 def main(args):
     cfg_infer = OmegaConf.load(args.config)
@@ -23,21 +26,22 @@ def main(args):
     model.eval()
     
     noisy_wavs = sorted(list(filter(lambda x: x.endswith("wav"), os.listdir(noisy_folder))))
+    clean_wavs = sorted(list(filter(lambda x: x.endswith("wav"), os.listdir(clean_folder))))
 
     inf_scp_list = []
     ref_scp_list = []
-    for wav_name in tqdm(noisy_wavs):
-        noisy, fs = sf.read(os.path.join(noisy_folder, wav_name), dtype='float32')
+    for (noisy_wav, clean_wav) in tqdm(list(zip(noisy_wavs, clean_wavs))):
+        noisy, fs = sf.read(os.path.join(noisy_folder, noisy_wav), dtype='float32')
         
         input = torch.FloatTensor(noisy).unsqueeze(0).to(device)
         with torch.inference_mode():
             output  = model(input)
         enhanced = output.cpu().detach().numpy().squeeze()
-        
-        uid = wav_name.split(".wav")[0]
+
+        uid = noisy_wav.split(".wav")[0]
         enh_path = os.path.join(enh_folder, uid + f"_enh.wav")
-        ref_path = os.path.join(clean_folder, wav_name)
-        
+        ref_path = os.path.join(clean_folder, clean_wav)
+
         inf_scp_list.append([uid, enh_path])
         ref_scp_list.append([uid, ref_path])
         

@@ -1,0 +1,20 @@
+# plot_config.yaml
+
+# 定义颜色代码到 Matplotlib 颜色名称的映射
+# 可用颜色: 'blue', 'green', 'red', 'cyan', 'magenta', 'yellow', 'black', 'white'
+color_map:
+  r: "red"
+  g: "green"
+  b: "blue"
+  y: "yellow"
+  c: "cyan"
+  m: "magenta"
+
+# 定义图例中每个颜色代码对应的标签名称
+legend_labels:
+  r: "GTCRN Baseline"
+  g: "AdaptConv Baseline"
+  b: "RepConv"
+  c: "Plain Convolution"
+  m: "Attention Mechanism"
+  y: "Concat Skip Connection"

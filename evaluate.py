@@ -9,19 +9,19 @@ def main(args):
     
     if args.metric == 'dnsmos':
         os.system(
-            ('python ./evaluation/calculate_nonintrusive_dnsmos.py '
+            ('./evaluation/venv/bin/python ./evaluation/calculate_nonintrusive_dnsmos.py '
                 f'--inf_scp {enh_folder}/inf.scp '
                 f'--output_dir {enh_folder}/scoring_dnsmos '
-                '--device cuda '
+                f'--device {args.dnsmos_device} '
                 '--job 1 '
-                '--convert_to_torch True '
+                '--convert_to_torch False '
                 '--primary_model ./DNSMOS/DNSMOS/sig_bak_ovr.onnx '
                 '--p808_model ./DNSMOS/DNSMOS/model_v8.onnx'
             )
         )    
     elif args.metric == 'intrusive':
         os.system(
-            ('python ./evaluation/calculate_intrusive_se_metrics.py '
+            ('./evaluation/venv/bin/python ./evaluation/calculate_intrusive_se_metrics.py '
              f'--ref_scp {enh_folder}/ref.scp '
              f'--inf_scp {enh_folder}/inf.scp '
              f'--output_dir {enh_folder}/scoring_intrusive '
@@ -41,6 +41,7 @@ if __name__ == "__main__":
     parser.add_argument('--metric', required=True, help="Metric to be calculated")
     parser.add_argument('--config', default='configs/cfg_infer.yaml')
     parser.add_argument('--device', default='0')
+    parser.add_argument('--dnsmos_device', default='cpu', help="Device for DNSMOS evaluation: 'cpu' or 'cuda'")
     
     args = parser.parse_args()
     os.environ["CUDA_VISIBLE_DEVICES"] = args.device

@@ -1,14 +1,39 @@
 """
 GTCRN: ShuffleNetV2 + SFE + TRA + 2 DPGRNN
-Ultra tiny, 33.0 MMACs, 23.67(48.2) K params
+Ultra tiny, 33.0 MMACs, 23.67 K params -> 93.28 MMac 89.429 K params ?
 """
-import profile
 import torch
 import numpy as np
 import torch.nn as nn
 from einops import rearrange
+import torch.nn.functional as F
 from torch.profiler import record_function
 
+calculate_macs_mode = False
+CHANNELS = 16
+
+
+class CausalConvBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, dilation=1, groups=1, use_deconv=False, is_last=False):
+        super().__init__()
+        assert kernel_size == (3, 3)
+        assert in_channels == out_channels
+        assert stride == (1, 1) or stride == 1
+        assert dilation[1] == 1
+        assert padding[1] == 1 and padding[0] == (2*dilation[0] if use_deconv else 0)
+        assert groups == 1
+        self.use_deconv = use_deconv
+
+        self.pad_size = (kernel_size[0]-1) * dilation[0]
+        conv_module = nn.ConvTranspose2d if use_deconv else nn.Conv2d
+        self.conv = conv_module(in_channels, out_channels, kernel_size, stride=stride, padding=padding, dilation=dilation, groups=groups)
+        self.bn = nn.BatchNorm2d(out_channels)
+        self.act = nn.Tanh() if is_last else nn.PReLU()
+
+    def forward(self, x):
+        x_pad = F.pad(x, [0, 0, self.pad_size, 0])
+        out1 = self.bn(self.conv(x_pad))
+        return self.act(out1)
 
 class ERB(nn.Module):
     def __init__(self, erb_subband_1, erb_subband_2, nfft=512, high_lim=8000, fs=16000):
@@ -78,21 +103,29 @@ class SFE(nn.Module):
 
 class TRA(nn.Module):
     """Temporal Recurrent Attention"""
-    def __init__(self, channels):
+    def __init__(self, channels, kernels, kat_heads):
         super().__init__()
+        self.kernels = kernels
+        self.kat_heads = kat_heads
         self.att_gru = nn.GRU(channels, channels*2, 1, batch_first=True)
-        self.att_fc = nn.Linear(channels*2, channels)
-        self.att_act = nn.Sigmoid()
+        self.att_fc1 = nn.Linear(channels*2, channels)
+        self.att_act1 = nn.Sigmoid()
+        self.att_fc2 = nn.Linear(channels * 2, kat_heads * kernels)
+        self.att_act2 = nn.Softmax(dim=2)
 
     def forward(self, x):
         """x: (B,C,T,F)"""
         zt = torch.mean(x.pow(2), dim=-1)  # (B,C,T)
         at = self.att_gru(zt.transpose(1,2))[0]
-        at = self.att_fc(at).transpose(1,2)
-        at = self.att_act(at)
-        At = at[..., None]  # (B,C,T,1)
+        at1 = self.att_fc1(at).transpose(1,2)
+        at1 = self.att_act1(at1)
+        At = at1[..., None]  # (B,C,T,1)
+        kat = self.att_fc2(at).transpose(1,2) # (B,kat_heads*kernels,T)
+        kat = kat.reshape(x.shape[0], self.kat_heads, self.kernels, x.shape[2])  # (B,kat_heads,kernels,T)
+        kat = self.att_act2(kat)
+        kat = torch.unbind(kat, dim=1)  # kat_heads * (B,kernels,T)
 
-        return x * At
+        return At, kat
 
 
 class ConvBlock(nn.Module):
@@ -104,32 +137,104 @@ class ConvBlock(nn.Module):
         self.act = nn.Tanh() if is_last else nn.PReLU()
     def forward(self, x):
         return self.act(self.bn(self.conv(x)))
+    
+
+class Conv2dAttention(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride=(1,1), padding=(0,0), dilation=(1,1), kernel_choices=1, use_deconv=False, groups=1, pad_left=0):
+        super().__init__()
+        self.pad_left = pad_left
+        self.kernel_size = kernel_size
+        self.dilation = dilation
+        self.stride = stride
+        self.padding = padding
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.groups = groups
+        assert out_channels % groups == 0 and in_channels % groups == 0
+        self.use_deconv = use_deconv
+        # candidates: (K, C_in, C_out, K_T, K_F)
+        # candidates_bias: (K, C_out)
+
+        self.candidates_bias = nn.Parameter(torch.empty((kernel_choices, out_channels), requires_grad=True))
+        if use_deconv:
+            in_channels, out_channels = out_channels, in_channels
+        self.candidates = nn.Parameter(torch.empty((kernel_choices, in_channels//groups, out_channels, *kernel_size)), requires_grad=True)
+
+        nn.init.kaiming_normal_(self.candidates)
+        nn.init.zeros_(self.candidates_bias)
+
+    def conv(self, x, attention):
+        x_pad = F.pad(x, [0, 0, self.pad_left, 0])  # pad left for causality
+        unfolded = F.unfold(x_pad, (self.kernel_size[0], 1), dilation=(self.dilation[0], 1), padding=(self.padding[0], 0), stride=(self.stride[0], 1))
+        unfolded2 = rearrange(unfolded, "b (c p) (t f) -> 1 (b t c) p f", c=x.shape[1], p=self.kernel_size[0], t=x.shape[2], f=x.shape[3])
+        # x: (B, C, T, F)
+        # unfolded: (B, C * K_T, T * F) -> (1, B*T*C, K_T, F)
+        # attention: (B, K, T)
+        grouped_kernels = torch.einsum("kiopq, bkt -> btiopq", self.candidates, attention)
+        grouped_kernels = rearrange(grouped_kernels, "b t i o p q -> (b t o) i p q")
+        grouped_bias = torch.einsum("ko, bkt -> bto", self.candidates_bias, attention)
+        grouped_bias = rearrange(grouped_bias, "b t o -> (b t o)")
+        out = F.conv2d(unfolded2, grouped_kernels, bias=grouped_bias, stride=self.stride, padding=(0, self.padding[1]), groups=x.shape[0]*x.shape[2]*self.groups)
+        out = rearrange(out, "1 (b t o) 1 f -> b o t f", b=x.shape[0], t=x.shape[2], o=self.out_channels)
+        return out
+     
+    def deconv(self, x, attention):
+        x_pad = F.pad(x, [0, 0, self.pad_left, 0])  # pad left for causality
+        unfolded = F.unfold(x_pad, (self.kernel_size[0] * self.dilation[0] - self.dilation[0] + 1, 1), dilation=(1, 1), padding=(0, 0), stride=(self.stride[0], 1))
+        unfolded2 = rearrange(unfolded, "b (c p) (t f) -> 1 (b t c) p f", c=x.shape[1], p=self.kernel_size[0] * self.dilation[0] - self.dilation[0] + 1, t=x.shape[2], f=x.shape[3])
+        # x: (B, C, T, F)
+        # unfolded: (B, C * K_T, T * F) -> (1, B*T*C, K_T, F)
+        # attention: (B, K, T)
+        grouped_kernels = torch.einsum("kiopq, bkt -> btiopq", self.candidates, attention)
+        grouped_kernels = rearrange(grouped_kernels, "b t i o p q -> (b t o) i p q")
+        grouped_bias = torch.einsum("ko, bkt -> bto", self.candidates_bias, attention)
+        grouped_bias = rearrange(grouped_bias, "b t o -> (b t o)")
+        out = F.conv_transpose2d(unfolded2, grouped_kernels, bias=grouped_bias, stride=self.stride, padding=self.padding, groups=x.shape[0]*x.shape[2]*self.groups, dilation=self.dilation)
+        out = rearrange(out, "1 (b t o) 1 f -> b o t f", b=x.shape[0], t=x.shape[2], o=self.out_channels)
+        return out
+    
+    def conv_and_sum(self, x, attention):
+        x_pad = F.pad(x, [0, 0, self.pad_left, 0])  # pad left for causality
+        candidates = rearrange(self.candidates, "k i o p q -> (o k) i p q")
+        bias = rearrange(self.candidates_bias, "k o -> (o k)")
+        out = F.conv2d(x_pad, candidates, bias=bias, stride=self.stride, padding=self.padding, groups=self.groups, dilation=self.dilation)
+        out = rearrange(out, "b (o k) t f -> b o k t f", o=self.out_channels, k=self.candidates_bias.shape[0])
+        out = torch.einsum("b o k t f, b k t -> b o t f", out, attention)
+        return out
+    
+    def deconv_and_sum(self, out, attention):
+        out = F.pad(out, [0, 0, self.pad_left, 0])  # pad left for causality
+        # attention = F.pad(attention, [self.pad_left, 0], "replicate")  # pad left for causality
+        candidates = rearrange(self.candidates, "k o i p q -> i (o k) p q")
+        bias = rearrange(self.candidates_bias, "k o -> (o k)")
+        out = F.conv_transpose2d(out, candidates, bias=bias, stride=self.stride, padding=self.padding, groups=self.groups, dilation=self.dilation)
+        out = rearrange(out, "b (o k) t f -> b o k t f", o=self.out_channels, k=self.candidates_bias.shape[0])
+        out = torch.einsum("b o k t f, b k t -> b o t f", out, attention)
+        return out
+    
+    def forward(self, x, attention):
+        if self.use_deconv:
+            if not calculate_macs_mode:
+                return self.deconv_and_sum(x, attention)
+            return self.deconv(x, attention)
+        if not calculate_macs_mode:
+            return self.conv_and_sum(x, attention)
+        return self.conv(x, attention)
 
 
 class GTConvBlock(nn.Module):
     """Group Temporal Convolution"""
-    def __init__(self, in_channels, hidden_channels, kernel_size, stride, padding, dilation, use_deconv=False):
+    def __init__(self, in_channels, hidden_channels, kernel_size, stride, padding, dilation, kernel_choices=8, use_deconv=False):
         super().__init__()
         self.use_deconv = use_deconv
         self.pad_size = (kernel_size[0]-1) * dilation[0]
-        conv_module = nn.ConvTranspose2d if use_deconv else nn.Conv2d
+        # conv_module = nn.ConvTranspose2d if use_deconv else nn.Conv2d
     
-        self.sfe = SFE(kernel_size=3, stride=1)
-        
-        self.point_conv1 = conv_module(in_channels//2*3, hidden_channels, 1)
-        self.point_bn1 = nn.BatchNorm2d(hidden_channels)
-        self.point_act = nn.PReLU()
+        # self.sfe = SFE(kernel_size=3, stride=1)
 
-        self.depth_conv = conv_module(hidden_channels, hidden_channels, kernel_size,
-                                            stride=stride, padding=padding,
-                                            dilation=dilation, groups=hidden_channels)
-        self.depth_bn = nn.BatchNorm2d(hidden_channels)
-        self.depth_act = nn.PReLU()
-
-        self.point_conv2 = conv_module(hidden_channels, in_channels//2, 1)
-        self.point_bn2 = nn.BatchNorm2d(in_channels//2)
+        self.conv = CausalConvBlock(in_channels//2, hidden_channels//2, kernel_size=kernel_size, stride=stride, padding=padding, dilation=dilation, is_last=False, use_deconv=use_deconv)
         
-        self.tra = TRA(in_channels//2)
+        # self.tra = TRA(in_channels//2, kernel_choices, 3)
 
     def shuffle(self, x1, x2):
         """x1, x2: (B,C,T,F)"""
@@ -142,13 +247,10 @@ class GTConvBlock(nn.Module):
         """x: (B, C, T, F)"""
         x1, x2 = torch.chunk(x, chunks=2, dim=1)
 
-        x1 = self.sfe(x1)
-        h1 = self.point_act(self.point_bn1(self.point_conv1(x1)))
-        h1 = nn.functional.pad(h1, [0, 0, self.pad_size, 0])
-        h1 = self.depth_act(self.depth_bn(self.depth_conv(h1)))
-        h1 = self.point_bn2(self.point_conv2(h1))
-
-        h1 = self.tra(h1)
+        # mask, (kat1, kat2, kat3) = self.tra(x1)
+        # x1 = self.sfe(x1)
+        h1 = self.conv(x1)
+        # h1 = h1 * mask
 
         x =  self.shuffle(h1, x2)
         
@@ -193,11 +295,11 @@ class DPGRNN(nn.Module):
         self.width = width
         self.hidden_size = hidden_size
 
-        self.intra_rnn = GRNN(input_size=input_size, hidden_size=hidden_size//2, bidirectional=True)
+        self.intra_rnn = nn.GRU(input_size=input_size, hidden_size=hidden_size//2, bidirectional=True, batch_first=True)
         self.intra_fc = nn.Linear(hidden_size, hidden_size)
         self.intra_ln = nn.LayerNorm((width, hidden_size), eps=1e-8)
 
-        self.inter_rnn = GRNN(input_size=input_size, hidden_size=hidden_size, bidirectional=False)
+        self.inter_rnn = nn.GRU(input_size=input_size, hidden_size=hidden_size, bidirectional=False, batch_first=True)
         self.inter_fc = nn.Linear(hidden_size, hidden_size)
         self.inter_ln = nn.LayerNorm(((width, hidden_size)), eps=1e-8)
     
@@ -231,18 +333,17 @@ class Encoder(nn.Module):
     def __init__(self):
         super().__init__()
         self.en_convs = nn.ModuleList([
-            ConvBlock(3*3, 16, (1,5), stride=(1,2), padding=(0,2), use_deconv=False, is_last=False),
-            ConvBlock(16, 16, (1,5), stride=(1,2), padding=(0,2), groups=2, use_deconv=False, is_last=False),
-            GTConvBlock(16, 16, (3,3), stride=(1,1), padding=(0,1), dilation=(1,1), use_deconv=False),
-            GTConvBlock(16, 16, (3,3), stride=(1,1), padding=(0,1), dilation=(2,1), use_deconv=False),
-            GTConvBlock(16, 16, (3,3), stride=(1,1), padding=(0,1), dilation=(5,1), use_deconv=False)
+            ConvBlock(3*3, CHANNELS, (1,5), stride=(1,2), padding=(0,2), use_deconv=False, is_last=False),
+            ConvBlock(CHANNELS, CHANNELS, (1,5), stride=(1,2), padding=(0,2), groups=2, use_deconv=False, is_last=False),
+            CausalConvBlock(CHANNELS, CHANNELS, (3,3), stride=(1,1), padding=(0,1), dilation=(1,1), use_deconv=False),
+            CausalConvBlock(CHANNELS, CHANNELS, (3,3), stride=(1,1), padding=(0,1), dilation=(2,1), use_deconv=False),
+            CausalConvBlock(CHANNELS, CHANNELS, (3,3), stride=(1,1), padding=(0,1), dilation=(5,1), use_deconv=False)
         ])
 
     def forward(self, x):
         en_outs = []
         for i in range(len(self.en_convs)):
-            with record_function(f"Encoder_layer_{i}: " + "ConvBlock" if i<2 else "GTConvBlock"):
-                x = self.en_convs[i](x)
+            x = self.en_convs[i](x)
             en_outs.append(x)
         return x, en_outs
 
@@ -251,18 +352,17 @@ class Decoder(nn.Module):
     def __init__(self):
         super().__init__()
         self.de_convs = nn.ModuleList([
-            GTConvBlock(16, 16, (3,3), stride=(1,1), padding=(2*5,1), dilation=(5,1), use_deconv=True),
-            GTConvBlock(16, 16, (3,3), stride=(1,1), padding=(2*2,1), dilation=(2,1), use_deconv=True),
-            GTConvBlock(16, 16, (3,3), stride=(1,1), padding=(2*1,1), dilation=(1,1), use_deconv=True),
-            ConvBlock(16, 16, (1,5), stride=(1,2), padding=(0,2), groups=2, use_deconv=True, is_last=False),
-            ConvBlock(16, 2, (1,5), stride=(1,2), padding=(0,2), use_deconv=True, is_last=True)
+            CausalConvBlock(CHANNELS, CHANNELS, (3,3), stride=(1,1), padding=(5*2,1), dilation=(5,1), use_deconv=True),
+            CausalConvBlock(CHANNELS, CHANNELS, (3,3), stride=(1,1), padding=(2*2,1), dilation=(2,1), use_deconv=True),
+            CausalConvBlock(CHANNELS, CHANNELS, (3,3), stride=(1,1), padding=(1*2,1), dilation=(1,1), use_deconv=True),
+            ConvBlock(CHANNELS, CHANNELS, (1,5), stride=(1,2), padding=(0,2), groups=2, use_deconv=True, is_last=False),
+            ConvBlock(CHANNELS, 2, (1,5), stride=(1,2), padding=(0,2), use_deconv=True, is_last=True)
         ])
 
     def forward(self, x, en_outs):
         N_layers = len(self.de_convs)
         for i in range(N_layers):
-            with record_function(f"Decoder_layer_{i}: " + "GTConvBlock" if i<3 else "ConvBlock"):
-                x = self.de_convs[i](x + en_outs[N_layers-1-i])
+            x = self.de_convs[i](x + en_outs[N_layers-1-i])
         return x
     
 
@@ -295,8 +395,8 @@ class GTCRN(nn.Module):
 
         self.encoder = Encoder()
         
-        self.dpgrnn1 = DPGRNN(16, 33, 16)
-        self.dpgrnn2 = DPGRNN(16, 33, 16)
+        self.dpgrnn1 = DPGRNN(CHANNELS, 33, CHANNELS)
+        self.dpgrnn2 = DPGRNN(CHANNELS, 33, CHANNELS)
         
         self.decoder = Decoder()
 
@@ -325,15 +425,12 @@ class GTCRN(nn.Module):
         feat = self.erb.bm(feat)  # (B,3,T,129)
         feat = self.sfe(feat)     # (B,9,T,129)
 
-        with record_function("Encoder"):
-            feat, en_outs = self.encoder(feat)
+        feat, en_outs = self.encoder(feat)
         
-        with record_function("DPGRNN"):
-            feat = self.dpgrnn1(feat) # (B,16,T,33)
-            feat = self.dpgrnn2(feat) # (B,16,T,33)
+        feat = self.dpgrnn1(feat) # (B,CHANNELS,T,33)
+        feat = self.dpgrnn2(feat) # (B,CHANNELS,T,33)
 
-        with record_function("Decoder"):
-            m_feat = self.decoder(feat, en_outs)
+        m_feat = self.decoder(feat, en_outs)
         
         m = self.erb.bs(m_feat)
 
@@ -348,12 +445,13 @@ class GTCRN(nn.Module):
 
 
 if __name__ == "__main__":
+    calculate_macs_mode = True
     model = GTCRN().eval()
 
     """complexity count"""
     from ptflops import get_model_complexity_info
     flops, params = get_model_complexity_info(model, (16000,), as_strings=True,
-                                            print_per_layer_stat=True, verbose=False, backend="aten")
+                                            print_per_layer_stat=True, verbose=False, backend='aten')
     params = 0
     for p in model.parameters():
         params += p.numel()

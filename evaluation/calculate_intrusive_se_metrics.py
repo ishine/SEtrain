@@ -7,12 +7,13 @@ import librosa
 import numpy as np
 import soundfile as sf
 from pesq import PesqError, pesq
-from pystoi import stoi
-from p_tqdm import p_map
+# from pystoi import stoi
+from pystoi.stoi import stoi as estoi_func
+from p_tqdm import p_map # type: ignore
 from tqdm import tqdm
 
 
-METRICS = ("SDR", "SISNR", "PESQ", "ESTOI")
+METRICS = ("SDR", "SISNR", "PESQ", "ESTOI", "STOI")
 
 ################################################################
 # Definition of metrics
@@ -27,7 +28,20 @@ def estoi_metric(ref, inf, fs=16000):
     Returns:
         estoi (float): ESTOI value between [0, 1]
     """
-    return stoi(ref, inf, fs_sig=fs, extended=True)
+    return estoi_func(ref, inf, fs_sig=fs, extended=True)
+
+
+def stoi_metric(ref, inf, fs=16000):
+    """Calculate Short-Time Objective Intelligibility (STOI).
+
+    Args:
+        ref (np.ndarray): reference signal (time,)
+        inf (np.ndarray): enhanced signal (time,)
+        fs (int): sampling rate in Hz
+    Returns:
+        stoi (float): ESTOI value between [0, 1]
+    """
+    return estoi_func(ref, inf, fs_sig=fs, extended=False)
 
 
 def pesq_metric(ref, inf, fs=8000):
@@ -154,6 +168,8 @@ def process_one_pair(data_pair):
             scores[metric] = sisnr_metric(ref, inf)
         elif metric == "SDR":
             scores[metric] = sdr_metric(ref, inf)
+        elif metric == "STOI":
+            scores[metric] = stoi_metric(ref, inf, fs=fs)
         else:
             raise NotImplementedError(metric)
 

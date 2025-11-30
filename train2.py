@@ -16,7 +16,7 @@ import torch.distributed as dist
 from torch.utils.tensorboard import SummaryWriter
 from distributed_utils import reduce_value
 
-from models.gtcrn_dynamic_end2end import GTCRN as Model
+from models.gtcrn_dynamic_clean import GTCRN as Model
 from loss_factory import HybridLoss as Loss
 from dataloader import DNS3Dataset as Dataset
 from scheduler import LinearWarmupCosineAnnealingLR as WarmupLR
@@ -304,7 +304,7 @@ class Trainer:
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('-C', '--config', default='configs/cfg_train.yaml')
+    parser.add_argument('-C', '--config', default='configs/cfg_train2.yaml')
     parser.add_argument('-D', '--device', default='0', help='The index of the available devices, e.g. 0,1,2,3')
 
     args = parser.parse_args()

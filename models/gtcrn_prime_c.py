@@ -9,6 +9,8 @@ import torch.nn as nn
 from einops import rearrange
 from torch.profiler import record_function
 
+CHANNELS = 32
+
 
 class ERB(nn.Module):
     def __init__(self, erb_subband_1, erb_subband_2, nfft=512, high_lim=8000, fs=16000):
@@ -231,11 +233,11 @@ class Encoder(nn.Module):
     def __init__(self):
         super().__init__()
         self.en_convs = nn.ModuleList([
-            ConvBlock(3*3, 16, (1,5), stride=(1,2), padding=(0,2), use_deconv=False, is_last=False),
-            ConvBlock(16, 16, (1,5), stride=(1,2), padding=(0,2), groups=2, use_deconv=False, is_last=False),
-            GTConvBlock(16, 16, (3,3), stride=(1,1), padding=(0,1), dilation=(1,1), use_deconv=False),
-            GTConvBlock(16, 16, (3,3), stride=(1,1), padding=(0,1), dilation=(2,1), use_deconv=False),
-            GTConvBlock(16, 16, (3,3), stride=(1,1), padding=(0,1), dilation=(5,1), use_deconv=False)
+            ConvBlock(3*3, CHANNELS, (1,5), stride=(1,2), padding=(0,2), use_deconv=False, is_last=False),
+            ConvBlock(CHANNELS, CHANNELS, (1,5), stride=(1,2), padding=(0,2), groups=2, use_deconv=False, is_last=False),
+            GTConvBlock(CHANNELS, CHANNELS, (3,3), stride=(1,1), padding=(0,1), dilation=(1,1), use_deconv=False),
+            GTConvBlock(CHANNELS, CHANNELS, (3,3), stride=(1,1), padding=(0,1), dilation=(2,1), use_deconv=False),
+            GTConvBlock(CHANNELS, CHANNELS, (3,3), stride=(1,1), padding=(0,1), dilation=(5,1), use_deconv=False)
         ])
 
     def forward(self, x):
@@ -251,11 +253,11 @@ class Decoder(nn.Module):
     def __init__(self):
         super().__init__()
         self.de_convs = nn.ModuleList([
-            GTConvBlock(16, 16, (3,3), stride=(1,1), padding=(2*5,1), dilation=(5,1), use_deconv=True),
-            GTConvBlock(16, 16, (3,3), stride=(1,1), padding=(2*2,1), dilation=(2,1), use_deconv=True),
-            GTConvBlock(16, 16, (3,3), stride=(1,1), padding=(2*1,1), dilation=(1,1), use_deconv=True),
-            ConvBlock(16, 16, (1,5), stride=(1,2), padding=(0,2), groups=2, use_deconv=True, is_last=False),
-            ConvBlock(16, 2, (1,5), stride=(1,2), padding=(0,2), use_deconv=True, is_last=True)
+            GTConvBlock(CHANNELS, CHANNELS, (3,3), stride=(1,1), padding=(2*5,1), dilation=(5,1), use_deconv=True),
+            GTConvBlock(CHANNELS, CHANNELS, (3,3), stride=(1,1), padding=(2*2,1), dilation=(2,1), use_deconv=True),
+            GTConvBlock(CHANNELS, CHANNELS, (3,3), stride=(1,1), padding=(2*1,1), dilation=(1,1), use_deconv=True),
+            ConvBlock(CHANNELS, CHANNELS, (1,5), stride=(1,2), padding=(0,2), groups=2, use_deconv=True, is_last=False),
+            ConvBlock(CHANNELS, 2, (1,5), stride=(1,2), padding=(0,2), use_deconv=True, is_last=True)
         ])
 
     def forward(self, x, en_outs):
@@ -295,8 +297,8 @@ class GTCRN(nn.Module):
 
         self.encoder = Encoder()
         
-        self.dpgrnn1 = DPGRNN(16, 33, 16)
-        self.dpgrnn2 = DPGRNN(16, 33, 16)
+        self.dpgrnn1 = DPGRNN(CHANNELS, 33, CHANNELS)
+        self.dpgrnn2 = DPGRNN(CHANNELS, 33, CHANNELS)
         
         self.decoder = Decoder()
 
@@ -329,8 +331,8 @@ class GTCRN(nn.Module):
             feat, en_outs = self.encoder(feat)
         
         with record_function("DPGRNN"):
-            feat = self.dpgrnn1(feat) # (B,16,T,33)
-            feat = self.dpgrnn2(feat) # (B,16,T,33)
+            feat = self.dpgrnn1(feat) # (B,CHANNELS,T,33)
+            feat = self.dpgrnn2(feat) # (B,CHANNELS,T,33)
 
         with record_function("Decoder"):
             m_feat = self.decoder(feat, en_outs)
@@ -353,7 +355,7 @@ if __name__ == "__main__":
     """complexity count"""
     from ptflops import get_model_complexity_info
     flops, params = get_model_complexity_info(model, (16000,), as_strings=True,
-                                            print_per_layer_stat=True, verbose=False, backend="aten")
+                                            print_per_layer_stat=True, verbose=True, backend="aten")
     params = 0
     for p in model.parameters():
         params += p.numel()
