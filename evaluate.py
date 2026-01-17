@@ -7,7 +7,7 @@ def main(args):
     enh_folder = config.network.enh_folder
     # enh_folder = '/data/ssd0/xiaobin.rong/Datasets/DNS3/test_noisy/'
     
-    if args.metric == 'dnsmos':
+    if args.metric == 'dnsmos' or args.metric == 'all':
         os.system(
             ('./evaluation/venv/bin/python ./evaluation/calculate_nonintrusive_dnsmos.py '
                 f'--inf_scp {enh_folder}/inf.scp '
@@ -19,7 +19,7 @@ def main(args):
                 '--p808_model ./DNSMOS/DNSMOS/model_v8.onnx'
             )
         )    
-    elif args.metric == 'intrusive':
+    if args.metric == 'intrusive' or args.metric == 'all':
         os.system(
             ('./evaluation/venv/bin/python ./evaluation/calculate_intrusive_se_metrics.py '
              f'--ref_scp {enh_folder}/ref.scp '
@@ -38,7 +38,7 @@ if __name__ == "__main__":
     import argparse
     
     parser = argparse.ArgumentParser()
-    parser.add_argument('--metric', required=True, help="Metric to be calculated")
+    parser.add_argument('--metric', default='all', help="Metric to be calculated")
     parser.add_argument('--config', default='configs/cfg_infer.yaml')
     parser.add_argument('--device', default='0')
     parser.add_argument('--dnsmos_device', default='cpu', help="Device for DNSMOS evaluation: 'cpu' or 'cuda'")
