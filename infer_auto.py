@@ -1,0 +1,95 @@
+import os
+import shutil
+import torch
+import soundfile as sf
+import importlib
+from tqdm import tqdm
+from omegaconf import OmegaConf
+from utils.dynamic_import import import_model
+
+# Removed hardcoded import
+# import models.mamba_thicker as module
+# from models.mamba_thicker import MambaEnhancer as Model
+
+# module.calculate_macs_mode = True
+
+def main(args):
+    cfg_infer = OmegaConf.load(args.config)
+    cfg_network = OmegaConf.load(cfg_infer.network.config)
+    
+    noisy_folder = cfg_infer.test_dataset.noisy_dir
+    clean_folder = cfg_infer.test_dataset.clean_dir
+    enh_folder = cfg_infer.network.enh_folder
+    os.makedirs(enh_folder, exist_ok=True)
+    
+    device = torch.device(f'cuda:{args.device}' if torch.cuda.is_available() else 'cpu')
+
+    # Dynamic model loading
+    # We might need to handle the case where 'model' section is not in cfg_infer (legacy)
+    # But we assume the automation pipeline adds it or uses cfg_infer_auto.yaml
+    if 'model' in cfg_infer:
+        model_path = cfg_infer.model.path
+        model_classname = cfg_infer.model.classname
+    else:
+        # Fallback or try to read from cfg_network if it was saved there?
+        # Typically train.py saves config.yaml in exp folder.
+        # cfg_network IS that config.yaml. So it should have 'model' section if trained with train_auto.py!
+        if 'model' in cfg_network:
+            model_path = cfg_network.model.path
+            model_classname = cfg_network.model.classname
+        else:
+            raise ValueError("Model configuration not found in inference or network config.")
+
+    # Load module to set flag
+    module = importlib.import_module(model_path)
+    if hasattr(module, 'calculate_macs_mode'):
+        module.calculate_macs_mode = True
+    
+    Model = getattr(module, model_classname)
+
+    model = Model(**cfg_network['network_config']).to(device)
+    checkpoint = torch.load(cfg_infer.network.checkpoint, map_location=device)
+    model.load_state_dict(checkpoint['model'])
+    model.eval()
+    
+    noisy_wavs = sorted(list(filter(lambda x: x.endswith("wav"), os.listdir(noisy_folder))))
+    clean_wavs = sorted(list(filter(lambda x: x.endswith("wav"), os.listdir(clean_folder))))
+
+    inf_scp_list = []
+    ref_scp_list = []
+    for (noisy_wav, clean_wav) in tqdm(list(zip(noisy_wavs, clean_wavs))):
+        noisy, fs = sf.read(os.path.join(noisy_folder, noisy_wav), dtype='float32')
+        
+        input = torch.FloatTensor(noisy).unsqueeze(0).to(device)
+        with torch.inference_mode():
+            output  = model(input)
+        enhanced = output.cpu().detach().numpy().squeeze()
+
+        uid = noisy_wav.split(".wav")[0]
+        enh_path = os.path.join(enh_folder, uid + f"_enh.wav")
+        ref_path = os.path.join(clean_folder, clean_wav)
+
+        inf_scp_list.append([uid, enh_path])
+        ref_scp_list.append([uid, ref_path])
+        
+        sf.write(enh_path, enhanced, fs)
+    
+    # Save paths into scp file for evaluation
+    with open(os.path.join(enh_folder, "inf.scp"), "w") as f:
+        for uid, audio_path in inf_scp_list:
+            f.write(f"{uid} {audio_path}\n")
+
+    with open(os.path.join(enh_folder, "ref.scp"), "w") as f:
+        for uid, audio_path in ref_scp_list:
+            f.write(f"{uid} {audio_path}\n")
+            
+
+if __name__ == "__main__":
+    import argparse
+    
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-C', '--config', default='configs/cfg_infer_auto.yaml')
+    parser.add_argument('-D', '--device', default='0', help='Index of the gpu device')
+
+    args = parser.parse_args()
+    main(args)

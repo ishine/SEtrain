@@ -1,0 +1,15 @@
+test_dataset: 
+  noisy_dir: /home/nis/zhiheng.wang/SEtrain/DNS3/test_noisy
+  clean_dir: /home/nis/zhiheng.wang/SEtrain/DNS3/test_clean
+
+network:
+  exp_path: /home/nis/zhiheng.wang/SEtrain/experiments/exp_gtcrn_2026-01-17-15h50m
+  config: ${network.exp_path}/config.yaml
+  ckpt_name: best_model_193
+  checkpoint: ${network.exp_path}/checkpoints/${network.ckpt_name}.tar
+  enh_folder: ${network.exp_path}/${network.ckpt_name}/enhanced_dns
+
+# Added for dynamic loading
+model:
+  path: models.mamba_thicker
+  classname: MambaEnhancer
