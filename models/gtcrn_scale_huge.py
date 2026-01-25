@@ -9,14 +9,14 @@ from einops import rearrange
 import torch.nn.functional as F
 
 # ==========================================
-#        SCALING CONFIGURATION
+#        SCALING CONFIGURATION 140.89M MACs
 # ==========================================
-CHANNELS = 32               # Base channels (Increase to 32 or 64 for larger models)
+CHANNELS = 28               # Base channels (Increase to 32 or 64 for larger models)
 DS_GROUP = 2                # Downsampling groups (ShuffleNet style)
-GT_DILATIONS = [1, 2, 4, 8] # Dilation pattern for the Encoder/Decoder
+GT_DILATIONS = [1, 2, 4, 7] # Dilation pattern for the Encoder/Decoder
 GT_KERNEL = (3, 3)          # Kernel size for GT blocks
 RNN_HIDDEN = 33             # Frequency dimension or hidden size for RNN
-RNN_REPEATS = 3             # How many DPGRNN modules to stack in the bottleneck
+RNN_REPEATS = 2             # How many DPGRNN modules to stack in the bottleneck
 USE_CONCAT_SKIP = True      # True: Concat (Better for scaling), False: Add (Lower param)
 # ==========================================
 
