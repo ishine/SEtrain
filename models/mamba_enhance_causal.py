@@ -179,6 +179,38 @@ class Mask(nn.Module):
         s = torch.stack([s_real, s_imag], dim=1)  # (B,2,T,F)
         return s
     
+class DownSample(nn.Module):
+    def __init__(self, in_dim, out_dim):
+        super(DownSample, self).__init__()
+        self.act = nn.PReLU()
+        self.proj = nn.Linear(in_dim*2, out_dim)
+        
+    def forward(self, x):
+        # x: (B, T, C)
+        # Shift to be causal: (0, x0), (x1, x2), ...
+        x = F.pad(x, (0, 0, 1, 0))
+        x = x[:, :-1, :]
+        
+        B, T, C = x.shape
+        x = x.reshape(B, T//2, C*2)
+        x = self.proj(x)
+        x = self.act(x)
+        return x
+
+class UpSample(nn.Module):
+    def __init__(self, in_dim, out_dim):
+        super(UpSample, self).__init__()
+        self.act = nn.PReLU()
+        self.proj = nn.Linear(in_dim, out_dim*2)
+        
+    def forward(self, x):
+        # x: (B, T, C)
+        x = self.proj(x)
+        x = self.act(x)
+        B, T, C = x.shape
+        x = x.reshape(B, T*2, C//2)
+        
+        return x
 
 class PureMambaBlock(nn.Module):
     def __init__(self, d_model):
@@ -221,10 +253,20 @@ class MambaEnhancer(nn.Module):
         self.input_fc = nn.Linear(129 * 3, d_model) 
         self.input_act = nn.PReLU()
 
-        # Mamba
-        self.backbone = nn.Sequential(*[
-            PureMambaBlock(d_model) for _ in range(n_layers)
-        ])
+        # U-Net Backbone
+        self.enc1 = PureMambaBlock(d_model)
+        self.down1 = DownSample(d_model, d_model)
+        
+        self.enc2 = PureMambaBlock(d_model)
+        self.down2 = DownSample(d_model, d_model)
+        
+        self.bottleneck = PureMambaBlock(d_model)
+        
+        self.up2 = UpSample(d_model, d_model)
+        self.dec2 = PureMambaBlock(d_model)
+        
+        self.up1 = UpSample(d_model, d_model)
+        self.dec1 = PureMambaBlock(d_model)
 
         # (B, T, d_model) -> (B, 2, T, 129)
         self.output_fc = nn.Linear(d_model, 129 * 2)
@@ -263,8 +305,32 @@ class MambaEnhancer(nn.Module):
         # (B, T, 129) -> (B, T, d_model)
         x_in = self.input_act(self.input_fc(x_in))
 
-        # (B, T, d_model)
-        x_mem = self.backbone(x_in)
+        # Padding for U-Net (divisible by 4)
+        B, T, D = x_in.shape
+        pad_t = 0
+        if T % 4 != 0:
+            pad_t = 4 - (T % 4)
+            x_in = F.pad(x_in, (0, 0, 0, pad_t))
+        
+        # U-Net Flow
+        e1 = self.enc1(x_in)
+        d1 = self.down1(e1)
+        
+        e2 = self.enc2(d1)
+        d2 = self.down2(e2)
+        
+        b = self.bottleneck(d2)
+        
+        u2 = self.up2(b)
+        u2 = u2 + e2
+        d_out2 = self.dec2(u2)
+        
+        u1 = self.up1(d_out2)
+        u1 = u1 + e1
+        x_mem = self.dec1(u1)
+        
+        if pad_t > 0:
+            x_mem = x_mem[:, :T, :]
 
         # (B, T, d_model) -> (B, T, 258)
         x_out = self.output_act(self.output_fc(x_mem))

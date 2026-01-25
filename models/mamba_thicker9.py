@@ -217,8 +217,8 @@ class MambaEnhancer(nn.Module):
         self.sfe = SFE(3, 1)   
         
         # (B, 9, T, 129) -> (B, T, d_model)
-        self.input_conv = nn.Conv2d(9, 3, kernel_size=1) 
-        self.input_fc = nn.Linear(129 * 3, d_model) 
+        self.input_conv = nn.Conv2d(9, 9, kernel_size=1) 
+        self.input_fc = nn.Linear(129 * 9, d_model) 
         self.input_act = nn.PReLU()
 
         # Mamba

@@ -12,6 +12,8 @@ except ImportError:
 
 CALCULATE_MACS_MODE = False
 
+DO_CALCULATION_CONPENSATION = True
+
 class BiMamba(Mamba):
     def forward(self, hidden_states, inference_params=None):
         """
@@ -88,7 +90,7 @@ class BiMamba(Mamba):
         y = y * F.silu(z)
         
         # Scan MACs approx: L * D * N * 3 (update state + compute output)
-        if CALCULATE_MACS_MODE:
+        if CALCULATE_MACS_MODE and DO_CALCULATION_CONPENSATION:
             scan_macs = int(seqlen * self.d_inner * self.d_state * 3) # (1, K) @ (K, 1) = K MACs
             if scan_macs > 0:
                 dummy_v = torch.zeros(1, scan_macs, device=device)
