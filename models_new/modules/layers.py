@@ -86,3 +86,64 @@ class Mask(nn.Module):
         s_imag = spec[:,1] * mask[:,0] + spec[:,0] * mask[:,1]
         s = torch.stack([s_real, s_imag], dim=1)  # (B,2,T,F)
         return s
+
+
+class LearnableFB(nn.Module):
+    def __init__(self, n_freqs, subbands, n_fft=512, fs=16000):
+        super().__init__()
+        self.enc = nn.Linear(n_freqs, subbands, bias=False)
+        self.dec = nn.Linear(subbands, n_freqs, bias=False)
+        
+        if subbands < n_freqs:
+            erb_subband_1 = 65
+            if subbands > erb_subband_1:
+                erb_subband_2 = subbands - erb_subband_1
+                filters = self.erb_filter_banks(erb_subband_1, erb_subband_2, n_fft, fs)
+                
+                W = torch.zeros(subbands, n_freqs)
+                W[:erb_subband_1, :erb_subband_1] = torch.eye(erb_subband_1)
+                W[erb_subband_1:, erb_subband_1:] = filters
+
+                self.enc.weight.data = W
+                self.dec.weight.data = W.T
+            else:
+                raise ValueError(f"subbands ({subbands}) should be larger than 65.")
+    
+    def hz2erb(self, freq_hz):
+        erb_f = 21.4*np.log10(0.00437*freq_hz + 1)
+        return erb_f
+
+    def erb2hz(self, erb_f):
+        freq_hz = (10**(erb_f/21.4) - 1)/0.00437
+        return freq_hz
+
+    def erb_filter_banks(self, erb_subband_1, erb_subband_2, nfft=512, fs=16000):
+        high_lim = fs / 2
+        low_lim = erb_subband_1/nfft * fs
+        erb_low = self.hz2erb(low_lim)
+        erb_high = self.hz2erb(high_lim)
+        erb_points = np.linspace(erb_low, erb_high, erb_subband_2)
+        bins = np.round(self.erb2hz(erb_points)/fs*nfft).astype(np.int32)
+        erb_filters = np.zeros([erb_subband_2, nfft // 2 + 1], dtype=np.float32)
+
+        erb_filters[0, bins[0]:bins[1]] = (bins[1] - np.arange(bins[0], bins[1]) + 1e-12) \
+                                                / (bins[1] - bins[0] + 1e-12)
+        for i in range(erb_subband_2-2):
+            erb_filters[i + 1, bins[i]:bins[i+1]] = (np.arange(bins[i], bins[i+1]) - bins[i] + 1e-12)\
+                                                    / (bins[i+1] - bins[i] + 1e-12)
+            erb_filters[i + 1, bins[i+1]:bins[i+2]] = (bins[i+2] - np.arange(bins[i+1], bins[i + 2])  + 1e-12) \
+                                                    / (bins[i + 2] - bins[i+1] + 1e-12)
+
+        erb_filters[-1, bins[-2]:bins[-1]+1] = 1- erb_filters[-2, bins[-2]:bins[-1]+1]
+        
+        erb_filters = erb_filters[:, erb_subband_1:]
+        return torch.from_numpy(np.abs(erb_filters))
+
+    def bm(self, x):
+        """x: (B,C,T,F)"""
+        return self.enc(x)
+    
+    def bs(self, x_sub):
+        """x: (B,C,T,F_sub)"""
+        return self.dec(x_sub)
+

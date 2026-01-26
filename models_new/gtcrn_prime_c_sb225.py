@@ -1,15 +1,20 @@
 """
-Refactored GTCRN: ShuffleNetV2 + SFE + TRA + 2 DPGRNN
-Using Dynamic TRA and Conv2dAttention
+GTCRN: ShuffleNetV2 + SFE + TRA + 2 DPGRNN
+Ultra tiny, 33.0 MMACs, 23.67(48.2) K params
+Refactored version using shared modules.
 """
 import torch
 import torch.nn as nn
 from einops import rearrange
 from torch.profiler import record_function
 
-from .modules import ERB, SFE, DynamicTRA, ConvBlock, Mask, DPGRNN, Conv2dAttention, set_calculate_macs_mode, DynamicGTConvBlock as GTConvBlock
+try:
+    from .modules import ERB, SFE, TRA, ConvBlock, Mask, DPGRNN, GTConvBlock
+except ImportError:
+    from modules import ERB, SFE, TRA, ConvBlock, Mask, DPGRNN, GTConvBlock
 
 CHANNELS = 16
+
 
 class Encoder(nn.Module):
     def __init__(self):
@@ -25,7 +30,8 @@ class Encoder(nn.Module):
     def forward(self, x):
         en_outs = []
         for i in range(len(self.en_convs)):
-            x = self.en_convs[i](x)
+            with record_function(f"Encoder_layer_{i}: " + "ConvBlock" if i<2 else "GTConvBlock"):
+                x = self.en_convs[i](x)
             en_outs.append(x)
         return x, en_outs
 
@@ -34,9 +40,9 @@ class Decoder(nn.Module):
     def __init__(self):
         super().__init__()
         self.de_convs = nn.ModuleList([
-            GTConvBlock(CHANNELS, CHANNELS, (3,3), stride=(1,1), padding=(5*2,1), dilation=(5,1), use_deconv=True),
+            GTConvBlock(CHANNELS, CHANNELS, (3,3), stride=(1,1), padding=(2*5,1), dilation=(5,1), use_deconv=True),
             GTConvBlock(CHANNELS, CHANNELS, (3,3), stride=(1,1), padding=(2*2,1), dilation=(2,1), use_deconv=True),
-            GTConvBlock(CHANNELS, CHANNELS, (3,3), stride=(1,1), padding=(1*2,1), dilation=(1,1), use_deconv=True),
+            GTConvBlock(CHANNELS, CHANNELS, (3,3), stride=(1,1), padding=(2*1,1), dilation=(1,1), use_deconv=True),
             ConvBlock(CHANNELS, CHANNELS, (1,5), stride=(1,2), padding=(0,2), groups=2, use_deconv=True, is_last=False),
             ConvBlock(CHANNELS, 2, (1,5), stride=(1,2), padding=(0,2), use_deconv=True, is_last=True)
         ])
@@ -44,8 +50,10 @@ class Decoder(nn.Module):
     def forward(self, x, en_outs):
         N_layers = len(self.de_convs)
         for i in range(N_layers):
-            x = self.de_convs[i](x + en_outs[N_layers-1-i])
+            with record_function(f"Decoder_layer_{i}: " + "GTConvBlock" if i<3 else "ConvBlock"):
+                x = self.de_convs[i](x + en_outs[N_layers-1-i])
         return x
+
 
 class GTCRN(nn.Module):
     def __init__(
@@ -59,13 +67,18 @@ class GTCRN(nn.Module):
         self.hop_len = hop_len
         self.win_len = win_len
         
-        self.erb = ERB(65, 64)
+        subbands = 225
+        self.erb = ERB(65, subbands - 65)
         self.sfe = SFE(3, 1)
 
         self.encoder = Encoder()
+
+        width = subbands
+        width = (width - 1) // 2 + 1
+        width = (width - 1) // 2 + 1
         
-        self.dpgrnn1 = DPGRNN(CHANNELS, 33, CHANNELS)
-        self.dpgrnn2 = DPGRNN(CHANNELS, 33, CHANNELS)
+        self.dpgrnn1 = DPGRNN(CHANNELS, width, CHANNELS)
+        self.dpgrnn2 = DPGRNN(CHANNELS, width, CHANNELS)
         
         self.decoder = Decoder()
 
@@ -94,12 +107,15 @@ class GTCRN(nn.Module):
         feat = self.erb.bm(feat)  # (B,3,T,129)
         feat = self.sfe(feat)     # (B,9,T,129)
 
-        feat, en_outs = self.encoder(feat)
+        with record_function("Encoder"):
+            feat, en_outs = self.encoder(feat)
         
-        feat = self.dpgrnn1(feat) # (B,CHANNELS,T,33)
-        feat = self.dpgrnn2(feat) # (B,CHANNELS,T,33)
+        with record_function("DPGRNN"):
+            feat = self.dpgrnn1(feat) # (B,CHANNELS,T,33)
+            feat = self.dpgrnn2(feat) # (B,CHANNELS,T,33)
 
-        m_feat = self.decoder(feat, en_outs)
+        with record_function("Decoder"):
+            m_feat = self.decoder(feat, en_outs)
         
         m = self.erb.bs(m_feat)
 
@@ -113,14 +129,13 @@ class GTCRN(nn.Module):
         return output
 
 if __name__ == "__main__":
-    set_calculate_macs_mode(True)
     model = GTCRN().eval()
 
     """complexity count"""
     try:
         from ptflops import get_model_complexity_info
         flops, params = get_model_complexity_info(model, (16000,), as_strings=True,
-                                                print_per_layer_stat=True, verbose=False, backend='aten')
+                                                print_per_layer_stat=True, verbose=True, backend="aten")
         params = 0
         for p in model.parameters():
             params += p.numel()
@@ -129,19 +144,6 @@ if __name__ == "__main__":
         print("ptflops not installed, skipping complexity count")
 
     """causality check"""
-    # Important: Reset MACS mode if needed, or keeping it True matches original script intent for this check?
-    # Original script keeps it True for complexity count, and then...
-    # CAUSALITY CHECK:
-    # In original: it defines `calculate_macs_mode = False` at top.
-    # __main__ sets `calculate_macs_mode = True` and then logs complexity.
-    # It does NOT reset it to False before causality check.
-    # Wait, causality check uses `model(x1)`.
-    # If `calculate_macs_mode` is True, `Conv2dAttention` uses `self.conv` (the grouped kernel construction).
-    # If `calculate_macs_mode` is False, it uses `self.conv_and_sum`.
-    # Original code set it to True. So it tests the `conv` path.
-    # I should check if `conv` path preserves causality. `pad_left` is used. Unfold uses padding.
-    # So I will leave it as True to match original script behavior.
-
     a = torch.randn(1, 16000)
     b = torch.randn(1, 16000)
     c = torch.randn(1, 16000)
