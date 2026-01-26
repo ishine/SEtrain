@@ -14,7 +14,7 @@ color_map:
 legend_labels:
   r: "GTCRN Baseline"
   g: "AdaptConv Baseline"
-  b: "RepConv"
-  c: "Plain Convolution"
-  m: "Attention Mechanism"
-  y: "Concat Skip Connection"
+  b: "Learnable ERB"
+  y: "Plain Convolution"
+  m: "Mamba Hybrid"
+  c: "Mamba Simple"
