@@ -51,6 +51,23 @@ class HybridLoss(nn.Module):
         return self.lamda_ri*(real_loss + imag_loss) + self.lamda_mag*mag_loss + sisnr
 
 
+class HybridLossAux(HybridLoss):
+    def __init__(self, aux_weight=0.3, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.aux_weight = aux_weight
+
+    def forward(self, y_pred, y_true):
+        if isinstance(y_pred, (list, tuple)):
+            y_pred_main, y_pred_aux = y_pred
+            # Ensure aux output matches y_true shape if needed? 
+            # Or assume it is same shape.
+            loss_main = super().forward(y_pred_main, y_true)
+            loss_aux = super().forward(y_pred_aux, y_true)
+            return loss_main + self.aux_weight * loss_aux
+        else:
+            return super().forward(y_pred, y_true)
+
+
 class STFTLoss(nn.Module):
     def __init__(self, n_fft=1024, hop_len=120, win_len=600, window="hann_window"):
         super().__init__()
