@@ -3,7 +3,54 @@ import torch.nn as nn
 from einops import rearrange
 from .layers import SFE
 from .attention import TRA, DynamicTRA
-from .conv import Conv2dAttention
+from .conv import Conv2dAttention, RepPointConv
+
+class GTConvBlockRepPoint(nn.Module):
+    """Group Temporal Convolution (Standard Version)"""
+    def __init__(self, in_channels, hidden_channels, kernel_size, stride, padding, dilation, use_deconv=False):
+        super().__init__()
+        self.use_deconv = use_deconv
+        self.pad_size = (kernel_size[0]-1) * dilation[0]
+        conv_module = nn.ConvTranspose2d if use_deconv else nn.Conv2d
+    
+        self.sfe = SFE(kernel_size=3, stride=1)
+        
+        self.point_conv1 = RepPointConv(in_channels//2*3, hidden_channels, stride=1, use_act=True)
+
+        self.depth_conv = conv_module(hidden_channels, hidden_channels, kernel_size,
+                                            stride=stride, padding=padding,
+                                            dilation=dilation, groups=hidden_channels)
+        self.depth_bn = nn.BatchNorm2d(hidden_channels)
+        self.depth_act = nn.PReLU()
+
+        self.point_conv2 = RepPointConv(hidden_channels, in_channels//2, stride=1, use_act=False)
+        
+        self.tra = TRA(in_channels//2)
+
+    def shuffle(self, x1, x2):
+        """x1, x2: (B,C,T,F)"""
+        x = torch.stack([x1, x2], dim=1)
+        x = x.transpose(1, 2).contiguous()  # (B,C,2,T,F)
+        x = rearrange(x, 'b c g t f -> b (c g) t f')  # (B,2C,T,F)
+        return x
+
+    def forward(self, x):
+        """x: (B, C, T, F)"""
+        x1, x2 = torch.chunk(x, chunks=2, dim=1)
+
+        x1 = self.sfe(x1)
+        # h1 = self.point_act(self.point_bn1(self.point_conv1(x1)))
+        h1 = self.point_conv1(x1)
+        h1 = nn.functional.pad(h1, [0, 0, self.pad_size, 0])
+        h1 = self.depth_act(self.depth_bn(self.depth_conv(h1)))
+        # h1 = self.point_bn2(self.point_conv2(h1))
+        h1 = self.point_conv2(h1)
+
+        h1 = self.tra(h1)
+
+        x =  self.shuffle(h1, x2)
+        
+        return x
 
 class GTConvBlock(nn.Module):
     """Group Temporal Convolution (Standard Version)"""

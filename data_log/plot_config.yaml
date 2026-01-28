@@ -14,7 +14,7 @@ color_map:
 legend_labels:
   r: "GTCRN Baseline"
   g: "AdaptConv Baseline"
-  b: "Learnable ERB"
-  y: "Plain Convolution"
+  b: "ERB"
+  y: "RepConv"
   m: "Mamba Hybrid"
   c: "Mamba Simple"

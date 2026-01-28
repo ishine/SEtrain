@@ -71,3 +71,44 @@ class DPGRNN(nn.Module):
         dual_out = inter_out.permute(0,3,1,2)  # (B,C,T,F)
         
         return dual_out
+
+class DPRNN(nn.Module):
+    """Dual-path RNN (Standard version)"""
+    def __init__(self, input_size, width, hidden_size, **kwargs):
+        super(DPRNN, self).__init__(**kwargs)
+        self.input_size = input_size
+        self.width = width
+        self.hidden_size = hidden_size
+
+        self.intra_rnn = nn.GRU(input_size=input_size, hidden_size=hidden_size//2, bidirectional=True, batch_first=True)
+        self.intra_fc = nn.Linear(hidden_size, hidden_size)
+        self.intra_ln = nn.LayerNorm((width, hidden_size), eps=1e-8)
+
+        self.inter_rnn = nn.GRU(input_size=input_size, hidden_size=hidden_size, bidirectional=False, batch_first=True)
+        self.inter_fc = nn.Linear(hidden_size, hidden_size)
+        self.inter_ln = nn.LayerNorm(((width, hidden_size)), eps=1e-8)
+
+    def forward(self, x):
+        """x: (B, C, T, F)"""
+        ## Intra RNN
+        x = x.permute(0, 2, 3, 1)  # (B,T,F,C)
+        intra_x = x.reshape(x.shape[0] * x.shape[1], x.shape[2], x.shape[3])  # (B*T,F,C)
+        intra_x = self.intra_rnn(intra_x)[0]  # (B*T,F,C)
+        intra_x = self.intra_fc(intra_x)      # (B*T,F,C)
+        intra_x = intra_x.reshape(x.shape[0], -1, self.width, self.hidden_size) # (B,T,F,C)
+        intra_x = self.intra_ln(intra_x)
+        intra_out = torch.add(x, intra_x)
+
+        ## Inter RNN
+        x = intra_out.permute(0,2,1,3)  # (B,F,T,C)
+        inter_x = x.reshape(x.shape[0] * x.shape[1], x.shape[2], x.shape[3]) 
+        inter_x = self.inter_rnn(inter_x)[0]  # (B*F,T,C)
+        inter_x = self.inter_fc(inter_x)      # (B*F,T,C)
+        inter_x = inter_x.reshape(x.shape[0], self.width, -1, self.hidden_size) # (B,F,T,C)
+        inter_x = inter_x.permute(0,2,1,3)   # (B,T,F,C)
+        inter_x = self.inter_ln(inter_x) 
+        inter_out = torch.add(intra_out, inter_x)
+        
+        dual_out = inter_out.permute(0,3,1,2)  # (B,C,T,F)
+        
+        return dual_out

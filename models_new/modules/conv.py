@@ -11,7 +11,7 @@ def set_calculate_macs_mode(mode: bool):
     global CALCULATE_MACS_MODE
     CALCULATE_MACS_MODE = mode
 
-class RepConvBlock(nn.Module):
+class RepConvBlockLegacy(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, dilation=1, groups=1, use_deconv=False, is_last=False, over_param_factor=1):
         super().__init__()
         assert kernel_size == (3, 3)
@@ -72,6 +72,193 @@ class RepConvBlock(nn.Module):
         
         out = self.conv_functional(x_pad, self.infer_conv_kernel, bias=self.infer_offset, stride=self.convs[0].stride, padding=self.convs[0].padding, dilation=self.convs[0].dilation, groups=self.convs[0].groups)
         return self.act(out)
+
+
+class RepConvBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, dilation=1, groups=1, use_deconv=False, is_last=False, over_param_factor=1, use_1d_kernel=False):
+        super().__init__()
+        if isinstance(stride, int): stride = (stride, stride)
+        if isinstance(padding, int): padding = (padding, padding)
+        if isinstance(dilation, int): dilation = (dilation, dilation)
+
+        assert kernel_size == (3, 3)
+        assert in_channels == out_channels
+        assert stride == (1, 1)
+        assert dilation[1] == 1
+        assert padding[1] == 1 and padding[0] == (2*dilation[0] if use_deconv else 0)
+        assert groups == 1
+        self.use_deconv = use_deconv
+        self.over_param_factor = over_param_factor
+        self.use_1d_kernel = use_1d_kernel
+
+        self.pad_size = (kernel_size[0]-1) * dilation[0]
+        conv_module = nn.ConvTranspose2d if use_deconv else nn.Conv2d
+        self.conv_functional = F.conv_transpose2d if use_deconv else F.conv2d
+        
+        self.convs = nn.ModuleList([conv_module(in_channels, out_channels, kernel_size, stride=stride, padding=padding, dilation=dilation, groups=groups) for _ in range(over_param_factor)])
+        self.bns = nn.ModuleList([nn.BatchNorm2d(out_channels) for _ in range(over_param_factor)])
+        
+        if use_1d_kernel:
+            self.h_conv = conv_module(in_channels, out_channels, (kernel_size[0], 1), stride=stride, padding=(padding[0], 0), dilation=dilation, groups=groups)
+            self.h_bn = nn.BatchNorm2d(out_channels)
+            self.w_conv = conv_module(in_channels, out_channels, (1, kernel_size[1]), stride=stride, padding=(0, padding[1]), dilation=dilation, groups=groups)
+            self.w_bn = nn.BatchNorm2d(out_channels)
+
+        self.point_conv = conv_module(in_channels, out_channels, (1,1), stride=1, padding=0, groups=groups)
+        self.point_bn = nn.BatchNorm2d(out_channels)
+        self.identity_bn = nn.BatchNorm2d(in_channels)
+        self.act = nn.Tanh() if is_last else nn.PReLU()
+        self.infer_initailized = False
+        self.infer_conv_kernel = None
+        self.infer_offset = None
+
+    def forward(self, x):
+        x_pad = F.pad(x, [0, 0, self.pad_size, 0])
+        
+        if not CALCULATE_MACS_MODE:
+            out1 = 0
+            for conv, bn in zip(self.convs, self.bns):
+                out1 += bn(conv(x_pad))
+            if self.use_1d_kernel:
+                out1 += self.h_bn(self.h_conv(x_pad))
+                out1 += self.w_bn(self.w_conv(x))
+            out2 = self.point_bn(self.point_conv(x))
+            out3 = self.identity_bn(x)
+            return self.act(out1 + out2 + out3)
+            
+        if not self.infer_initailized:
+            if self.use_deconv:
+                bn_reshape = lambda x: x.reshape(1, -1, 1, 1)
+                identity_index = 0
+            else:
+                bn_reshape = lambda x: x.reshape(-1, 1, 1, 1)
+                identity_index = 2
+            
+            self.infer_conv_kernel = torch.zeros_like(self.convs[0].weight)
+            self.infer_offset = torch.zeros_like(self.convs[0].bias)
+
+            for conv, bn in zip(self.convs, self.bns):
+                self.infer_conv_kernel += conv.weight * bn_reshape(bn.weight) / bn_reshape((bn.running_var + bn.eps).sqrt())
+                self.infer_offset += (conv.bias - bn.running_mean) * bn.weight / (bn.running_var + bn.eps).sqrt() + bn.bias
+                
+            if self.use_1d_kernel:
+                self.infer_conv_kernel[:, :, :, 1] += (self.h_conv.weight * bn_reshape(self.h_bn.weight) / bn_reshape((self.h_bn.running_var + self.h_bn.eps).sqrt())).squeeze(-1)
+                self.infer_offset += (self.h_conv.bias - self.h_bn.running_mean) * self.h_bn.weight / (self.h_bn.running_var + self.h_bn.eps).sqrt() + self.h_bn.bias
+                self.infer_conv_kernel[:, :, identity_index, :] += (self.w_conv.weight * bn_reshape(self.w_bn.weight) / bn_reshape((self.w_bn.running_var + self.w_bn.eps).sqrt())).squeeze(-2)
+                self.infer_offset += (self.w_conv.bias - self.w_bn.running_mean) * self.w_bn.weight / (self.w_bn.running_var + self.w_bn.eps).sqrt() + self.w_bn.bias
+
+            self.infer_conv_kernel[:, :, identity_index, 1] += (self.point_conv.weight * bn_reshape(self.point_bn.weight) / bn_reshape((self.point_bn.running_var + self.point_bn.eps).sqrt())).squeeze(-1).squeeze(-1)
+            self.infer_offset += (self.point_conv.bias - self.point_bn.running_mean) * self.point_bn.weight / (self.point_bn.running_var + self.point_bn.eps).sqrt() + self.point_bn.bias
+            self.infer_conv_kernel[:, :, identity_index, 1] += torch.diag(self.identity_bn.weight / (self.identity_bn.running_var + self.identity_bn.eps).sqrt())
+            self.infer_offset += ( - self.identity_bn.running_mean) * self.identity_bn.weight / (self.identity_bn.running_var + self.identity_bn.eps).sqrt() + self.identity_bn.bias
+            self.infer_initailized = True
+        
+        out = self.conv_functional(x_pad, self.infer_conv_kernel, bias=self.infer_offset, stride=self.convs[0].stride, padding=self.convs[0].padding, dilation=self.convs[0].dilation, groups=self.convs[0].groups)
+        return self.act(out)
+
+
+class RepPointConv(nn.Module):
+    def __init__(self, in_channels, out_channels, stride=1, padding=0, dilation=1, groups=1, is_last=False, use_act=False):
+        super().__init__()
+        if isinstance(stride, int): stride = (stride, stride)
+        if isinstance(padding, int): padding = (padding, padding)
+        if isinstance(dilation, int): dilation = (dilation, dilation)
+
+        assert groups == 1
+        assert padding == (0, 0)
+        assert dilation == (1, 1)
+        
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.stride = stride
+        
+        mid_channels = in_channels * 2
+        
+        self.over_conv_down = nn.Conv2d(in_channels, mid_channels, 1, stride=stride, padding=0, bias=True)
+        self.over_bn_down = nn.BatchNorm2d(mid_channels)
+        self.over_conv_up = nn.Conv2d(mid_channels, out_channels, 1, stride=1, padding=0, bias=True)
+        self.over_bn_up = nn.BatchNorm2d(out_channels)  
+        
+        self.std_conv = nn.Conv2d(in_channels, out_channels, 1, stride=stride, padding=0, bias=True)
+        self.std_bn = nn.BatchNorm2d(out_channels)
+        
+        self.has_identity = (in_channels == out_channels) and (stride == (1,1))
+        if self.has_identity:
+            self.identity_bn = nn.BatchNorm2d(in_channels)
+            
+        if use_act:
+            self.act = nn.Tanh() if is_last else nn.PReLU()
+        else:
+            self.act = nn.Identity()
+        self.infer_initailized = False
+        self.infer_conv_kernel = None
+        self.infer_offset = None
+        
+    def forward(self, x):
+        if not CALCULATE_MACS_MODE:
+            x_down = self.over_bn_down(self.over_conv_down(x))
+            out_over = self.over_bn_up(self.over_conv_up(x_down))
+            
+            out_std = self.std_bn(self.std_conv(x))
+            
+            out = out_over + out_std
+            
+            if self.has_identity:
+                out += self.identity_bn(x)
+            
+            return self.act(out)
+        
+        if not self.infer_initailized:
+            self._fuse_weights()
+            self.infer_initailized = True
+        
+        return self.act(F.conv2d(x, self.infer_conv_kernel, bias=self.infer_offset, stride=self.stride))
+
+    def _fuse_weights(self):
+        def fuse_conv_bn(conv, bn):
+            w = conv.weight
+            mean = bn.running_mean
+            var_sqrt = (bn.running_var + bn.eps).sqrt()
+            gamma = bn.weight
+            beta = bn.bias
+            b = conv.bias
+            if b is None:
+                b = mean.new_zeros(mean.shape)
+            gamma = gamma.reshape(-1, 1, 1, 1)
+            var_sqrt = var_sqrt.reshape(-1, 1, 1, 1)
+            beta = beta.reshape(-1)
+            mean = mean.reshape(-1)
+            w_fused = w * (gamma / var_sqrt)
+            b_fused = (b - mean) * (gamma.reshape(-1) / var_sqrt.reshape(-1)) + beta
+            return w_fused, b_fused
+
+        k_std, b_std = fuse_conv_bn(self.std_conv, self.std_bn)
+        k_down, b_down = fuse_conv_bn(self.over_conv_down, self.over_bn_down)
+        k_up, b_up = fuse_conv_bn(self.over_conv_up, self.over_bn_up)
+            
+        w_up_mat = k_up.reshape(self.out_channels, -1)
+        w_down_mat = k_down.reshape(k_down.shape[0], -1)
+        
+        w_over_mat = w_up_mat @ w_down_mat
+        k_over = w_over_mat.reshape(self.out_channels, self.in_channels, 1, 1)
+        b_over = w_up_mat @ b_down + b_up
+        
+        k_id = 0
+        b_id = 0
+        if self.has_identity:
+            gamma = self.identity_bn.weight
+            beta = self.identity_bn.bias
+            mean = self.identity_bn.running_mean
+            var_sqrt = (self.identity_bn.running_var + self.identity_bn.eps).sqrt()
+            
+            k_id = torch.zeros_like(k_std)
+            for i in range(self.in_channels):
+                k_id[i, i, 0, 0] = gamma[i] / var_sqrt[i]
+            b_id = beta - mean * gamma / var_sqrt
+            
+        self.infer_conv_kernel = k_std + k_over + k_id
+        self.infer_offset = b_std + b_over + b_id
+
 
 class Conv2dAttention(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size, stride=(1,1), padding=(0,0), dilation=(1,1), kernel_choices=1, use_deconv=False, groups=1, pad_left=0):
