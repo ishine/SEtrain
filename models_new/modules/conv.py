@@ -12,7 +12,7 @@ def set_calculate_macs_mode(mode: bool):
     CALCULATE_MACS_MODE = mode
 
 class RepConvBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, dilation=1, groups=1, use_deconv=False, is_last=False):
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, dilation=1, groups=1, use_deconv=False, is_last=False, over_param_factor=1):
         super().__init__()
         assert kernel_size == (3, 3)
         assert in_channels == out_channels
@@ -21,12 +21,15 @@ class RepConvBlock(nn.Module):
         assert padding[1] == 1 and padding[0] == (2*dilation[0] if use_deconv else 0)
         assert groups == 1
         self.use_deconv = use_deconv
+        self.over_param_factor = over_param_factor
 
         self.pad_size = (kernel_size[0]-1) * dilation[0]
         conv_module = nn.ConvTranspose2d if use_deconv else nn.Conv2d
         self.conv_functional = F.conv_transpose2d if use_deconv else F.conv2d
-        self.conv = conv_module(in_channels, out_channels, kernel_size, stride=stride, padding=padding, dilation=dilation, groups=groups)
-        self.bn = nn.BatchNorm2d(out_channels)
+        
+        self.convs = nn.ModuleList([conv_module(in_channels, out_channels, kernel_size, stride=stride, padding=padding, dilation=dilation, groups=groups) for _ in range(over_param_factor)])
+        self.bns = nn.ModuleList([nn.BatchNorm2d(out_channels) for _ in range(over_param_factor)])
+        
         self.point_conv = conv_module(in_channels, out_channels, (1,1), stride=1, padding=0, groups=groups)
         self.point_bn = nn.BatchNorm2d(out_channels)
         self.identity_bn = nn.BatchNorm2d(in_channels)
@@ -38,9 +41,10 @@ class RepConvBlock(nn.Module):
     def forward(self, x):
         x_pad = F.pad(x, [0, 0, self.pad_size, 0])
         
-        # Use module-level flag, or can be overridden by instance attribute if we added one (but keeping signature close to original)
         if not CALCULATE_MACS_MODE:
-            out1 = self.bn(self.conv(x_pad))
+            out1 = 0
+            for conv, bn in zip(self.convs, self.bns):
+                out1 += bn(conv(x_pad))
             out2 = self.point_bn(self.point_conv(x))
             out3 = self.identity_bn(x)
             return self.act(out1 + out2 + out3)
@@ -52,15 +56,21 @@ class RepConvBlock(nn.Module):
             else:
                 bn_reshape = lambda x: x.reshape(-1, 1, 1, 1)
                 identity_index = 2
-            self.infer_conv_kernel = self.conv.weight * bn_reshape(self.bn.weight) / bn_reshape((self.bn.running_var + self.bn.eps).sqrt())
+            
+            self.infer_conv_kernel = torch.zeros_like(self.convs[0].weight)
+            self.infer_offset = torch.zeros_like(self.convs[0].bias)
+
+            for conv, bn in zip(self.convs, self.bns):
+                self.infer_conv_kernel += conv.weight * bn_reshape(bn.weight) / bn_reshape((bn.running_var + bn.eps).sqrt())
+                self.infer_offset += (conv.bias - bn.running_mean) * bn.weight / (bn.running_var + bn.eps).sqrt() + bn.bias
+                
             self.infer_conv_kernel[:, :, identity_index, 1] += (self.point_conv.weight * bn_reshape(self.point_bn.weight) / bn_reshape((self.point_bn.running_var + self.point_bn.eps).sqrt())).squeeze(-1).squeeze(-1)
-            self.infer_conv_kernel[:, :, identity_index, 1] += torch.diag(self.identity_bn.weight / (self.identity_bn.running_var + self.identity_bn.eps).sqrt())
-            self.infer_offset = (self.conv.bias - self.bn.running_mean) * self.bn.weight / (self.bn.running_var + self.bn.eps).sqrt() + self.bn.bias
             self.infer_offset += (self.point_conv.bias - self.point_bn.running_mean) * self.point_bn.weight / (self.point_bn.running_var + self.point_bn.eps).sqrt() + self.point_bn.bias
+            self.infer_conv_kernel[:, :, identity_index, 1] += torch.diag(self.identity_bn.weight / (self.identity_bn.running_var + self.identity_bn.eps).sqrt())
             self.infer_offset += ( - self.identity_bn.running_mean) * self.identity_bn.weight / (self.identity_bn.running_var + self.identity_bn.eps).sqrt() + self.identity_bn.bias
             self.infer_initailized = True
         
-        out = self.conv_functional(x_pad, self.infer_conv_kernel, bias=self.infer_offset, stride=self.conv.stride, padding=self.conv.padding, dilation=self.conv.dilation, groups=self.conv.groups)
+        out = self.conv_functional(x_pad, self.infer_conv_kernel, bias=self.infer_offset, stride=self.convs[0].stride, padding=self.convs[0].padding, dilation=self.convs[0].dilation, groups=self.convs[0].groups)
         return self.act(out)
 
 class Conv2dAttention(nn.Module):
