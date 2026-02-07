@@ -1,5 +1,6 @@
 import os
 from omegaconf import OmegaConf
+import sys
 
 
 def main(args):
@@ -9,7 +10,7 @@ def main(args):
     
     if args.metric == 'dnsmos' or args.metric == 'all':
         os.system(
-            ('./evaluation/venv/bin/python ./evaluation/calculate_nonintrusive_dnsmos.py '
+            (f'{sys.executable} ./evaluation/calculate_nonintrusive_dnsmos.py '
                 f'--inf_scp {enh_folder}/inf.scp '
                 f'--output_dir {enh_folder}/scoring_dnsmos '
                 f'--device {args.dnsmos_device} '
@@ -21,7 +22,7 @@ def main(args):
         )    
     if args.metric == 'intrusive' or args.metric == 'all':
         os.system(
-            ('./evaluation/venv/bin/python ./evaluation/calculate_intrusive_se_metrics.py '
+            (f'{sys.executable} ./evaluation/calculate_intrusive_se_metrics.py '
              f'--ref_scp {enh_folder}/ref.scp '
              f'--inf_scp {enh_folder}/inf.scp '
              f'--output_dir {enh_folder}/scoring_intrusive '
